@@ -1,0 +1,354 @@
+---
+title: "Python SDK Reference for the Proof Exchange"
+sidebarTitle: "Python"
+description: "Complete reference for proof-trading-sdk: PyO3 Rust core bindings, ExchangeClient, all action builders, crypto helpers, and the hardware-key signing path."
+---
+
+The `proof-trading-sdk` Python package brings the full Proof Exchange signing and codec stack to Python. Cryptographic operations — Ed25519 key generation, signing, MessagePack encoding, and chain-ID binding — are handled entirely in the shared Rust core via PyO3, so the wire bytes produced by Python are byte-for-byte identical to those produced by the TypeScript SDK. Transport, configuration, rate-limit tracking, and async logic are native Python built on top of `httpx`.
+
+## Installation
+
+```bash
+pip install proof-trading-sdk
+```
+
+### Architecture
+
+<Info>
+The package exposes a `_native` PyO3 extension module backed by the same `proof-trading-sdk` Rust crate that powers the TypeScript SDK's wire format. Python code calls into `_native` for any operation that touches key material or wire bytes; nothing security-critical is reimplemented in Python.
+</Info>
+
+The two-layer design:
+
+| Layer | Where it runs | Responsibilities |
+|---|---|---|
+| `_native` (PyO3 / Rust) | Rust, compiled into the wheel | Key generation, Ed25519 signing, MessagePack encode/decode, signing-message construction |
+| Python (`client.py`, `actions.py`, …) | CPython | HTTP transport (`httpx`), nonce allocation, config loading, rate-limit tracking, action dataclasses |
+
+---
+
+## Exports reference
+
+All public symbols are available from the top-level `proof_trading_sdk` namespace.
+
+### Crypto
+
+```python
+from proof_trading_sdk import (
+    generate_keypair,
+    pubkey_to_owner,
+    owner_to_hex,
+    hex_to_owner,
+    chain_id_from_string,
+    sign_and_encode,
+    decode_tx,
+    verify_signature,
+    encode_signed_tx,
+    SigningHandle,
+    load_key_from_fd,
+    load_key_from_pkcs11,
+)
+```
+
+| Symbol | Description |
+|---|---|
+| `generate_keypair(seed?)` | Generate an Ed25519 keypair. Returns `{"private_key": bytes, "public_key": bytes}`. |
+| `pubkey_to_owner(pubkey)` | Derive the 20-byte owner address from a 32-byte Ed25519 public key via keccak256. |
+| `owner_to_hex(owner)` | Encode 20-byte owner `bytes` to a 40-char hex string (no `0x`). |
+| `hex_to_owner(hex_str)` | Decode a hex string (with or without `0x`) to 20-byte owner `bytes`. |
+| `chain_id_from_string(network)` | Hash a CometBFT network string to its 32-byte chain ID binding. |
+| `sign_and_encode(chain_id, action_type, payload, seq, secret_key)` | Sign a pre-encoded payload and pack it into a wire envelope. |
+| `encode_signed_tx(action_type, payload, seq, pubkey, signature)` | Assemble a wire envelope from pre-computed signature bytes (gateway relay path). |
+| `decode_tx(bytes)` | Fully decode a wire envelope into `{"action_type", "seq", "payload", "pubkey", "signature"}`. |
+| `verify_signature(chain_id, pubkey, signature, action_type, seq, payload)` | Verify an Ed25519 signature over the canonical signing message. |
+
+#### Hardware-isolated key paths
+
+Two functions load keys in a way that keeps the secret material in Rust (or HSM) memory and **never exposes it to Python**:
+
+```python
+from proof_trading_sdk import load_key_from_fd, load_key_from_pkcs11, SigningHandle
+
+# Load from a file descriptor (e.g. a sealed pipe or tmpfs mount)
+handle: SigningHandle = load_key_from_fd(fd_number)
+
+# Load via PKCS#11 (HSM / TPM / cloud KMS)
+handle: SigningHandle = load_key_from_pkcs11(library_path, slot_id, pin)
+```
+
+Pass the resulting `SigningHandle` to `ExchangeClient` as `key_handle=`. The handle's `.sign_and_encode()` method performs signing entirely in Rust — no key bytes cross the Python/Rust boundary at any point.
+
+---
+
+### Actions
+
+Every wire action type has a typed Python dataclass. Action type bytes are generated at runtime from the Rust core via `get_action_types()`, so the map can never drift from the Rust `impl_action_encoding!` list.
+
+```python
+from proof_trading_sdk import (
+    Side, TimeInForce,
+    PlaceOrder, MarketOrder,
+    CancelOrder, CancelClientOrder, CancelAllOrders,
+    CancelReplaceOrder, AmendOrder,
+    ClosePosition, ApproveAgent, RevokeAgent,
+    OracleUpdate, Deposit, Withdraw, WithdrawRequest,
+    ConfirmDeposit, ConfirmWithdrawal, FailWithdrawal,
+    ResolveEvent, SetUserMarketLeverage,
+    CreateMarket, CreateImpactMarket, UpdateMarketFees,
+    encode_action, decode_action,
+)
+```
+
+**Enums**
+
+| Symbol | Values |
+|---|---|
+| `Side` | `Side.Buy = "Buy"`, `Side.Sell = "Sell"` |
+| `TimeInForce` | `TimeInForce.Gtc = "Gtc"`, `TimeInForce.Ioc = "Ioc"`, `TimeInForce.Fok = "Fok"` |
+
+**Core trading actions**
+
+| Class | Key fields |
+|---|---|
+| `PlaceOrder` | `market`, `owner: bytes`, `side`, `price`, `quantity`, `time_in_force`, `post_only`, `reduce_only`, `client_order_id?` |
+| `MarketOrder` | `market`, `owner: bytes`, `side`, `quantity`, `client_order_id?` |
+| `CancelOrder` | `order_id`, `owner: bytes` |
+| `CancelClientOrder` | `owner: bytes`, `client_order_id` |
+| `CancelAllOrders` | `owner: bytes`, `market?` |
+| `CancelReplaceOrder` | `owner: bytes`, `market`, `side`, `price`, `quantity`, `cancel_order_id?`, `cancel_client_order_id?` |
+| `AmendOrder` | `owner: bytes`, `order_id`, `new_price?`, `new_quantity?` |
+| `ClosePosition` | `market`, `owner: bytes` |
+
+**Account and agent actions**
+
+| Class | Key fields |
+|---|---|
+| `ApproveAgent` | `owner: bytes`, `agent_pubkey: bytes` |
+| `RevokeAgent` | `owner: bytes`, `agent_pubkey: bytes` |
+| `SetUserMarketLeverage` | `owner: bytes`, `market`, `user_im_bps` |
+| `WithdrawRequest` | `owner: bytes`, `amount`, `solana_destination: bytes` |
+
+**Relayer / admin actions**
+
+`OracleUpdate`, `Deposit`, `Withdraw`, `ConfirmDeposit`, `ConfirmWithdrawal`, `FailWithdrawal`, `ResolveEvent`, `CreateMarket`, `CreateImpactMarket`, `UpdateMarketFees`
+
+**Codec helpers**
+
+```python
+# Encode any Action to (action_type_int, payload_bytes) via the Rust core
+action_type, payload = encode_action(PlaceOrder(...))
+
+# Decode raw payload bytes back to a field dict
+fields = decode_action(action_type, payload)
+```
+
+<Note>
+Python action dataclasses do not implement the MessagePack codec. They assemble a field `dict` keyed by the Rust struct's snake_case field names; the shared Rust core (`_native.encode_action`) deserialises that dict into the typed payload struct and produces authoritative bytes via `rmp-serde` — the same path the engine uses.
+</Note>
+
+---
+
+### Errors
+
+```python
+from proof_trading_sdk import (
+    ProofTradingSdkError,
+    AuthenticationError,
+    CodecError,
+    EngineError,
+    GatewayError,
+    RateLimited,
+    SigningError,
+    TransportError,
+    get_error_name,
+    get_error_code_table,
+)
+```
+
+**Exception hierarchy**
+
+```
+ProofTradingSdkError
+├── CodecError          — MessagePack encode/decode failure
+├── SigningError        — Ed25519 key load or signing failure
+├── AuthenticationError — HTTP 401 / 403 (invalid or missing API key)
+├── EngineError         — Engine rejection with a typed error code
+│       .code: int      — e.g. 21 for InvalidNonce
+│       .name: str      — canonical name from the Rust manifest
+│       .message: str   — human-readable description
+├── TransportError      — HTTP/WebSocket connection, DNS, or timeout error
+│       .status_code: int | None
+│   └── GatewayError    — Gateway 5xx; retry with backoff
+│           .body: str
+└── RateLimited         — HTTP 429
+        .retry_after_secs: float
+        .bucket: str
+```
+
+**Error code utilities**
+
+```python
+# Look up a canonical error name by code
+get_error_name(21)           # → "InvalidNonce"
+
+# Get the full manifest from the Rust core — [{code, name, meaning}, ...]
+table = get_error_code_table()
+```
+
+---
+
+### `NonceAllocator`
+
+```python
+from proof_trading_sdk import NonceAllocator
+
+alloc = NonceAllocator()
+seq = alloc.allocate()   # → current millisecond timestamp, monotonically increasing
+```
+
+`ExchangeClient` creates one internally. Use `NonceAllocator` directly only when constructing wire envelopes outside of the client (e.g. batch signing tools).
+
+---
+
+### `ExchangeClient`
+
+The synchronous HTTP client. All signing and codec operations call into the shared Rust core; transport uses `httpx`.
+
+```python
+from proof_trading_sdk import ExchangeClient, PlaceOrder, Side, TimeInForce
+
+client = ExchangeClient(
+    gateway_url="https://api.dev.proof.trade",
+    api_key="<your-api-key>",
+    secret_key=private_key_bytes,   # 32-byte Ed25519 seed
+    chain_id=chain_id_bytes,        # 32-byte chain binding
+)
+```
+
+**Constructor arguments**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `gateway_url` | `str` | Base URL of the gateway API |
+| `api_key` | `str` | `X-API-Key` header for gateway authentication |
+| `secret_key` | `bytes \| None` | 32-byte Ed25519 signing seed. Stored on Python's heap — prefer `key_handle` for production. |
+| `key_handle` | `SigningHandle \| None` | Opaque hardware-isolated signing handle (takes precedence over `secret_key`). Key never enters Python memory. |
+| `chain_id` | `bytes \| None` | 32-byte chain binding. Defaults to `UNBOUND_CHAIN_ID` (zeros) if omitted — pin this in production. |
+| `config` | `SdkConfig \| None` | Pre-built config object; overrides individual parameters. |
+| `timeout_secs` | `int` | HTTP request timeout in seconds. |
+
+**Submitting actions**
+
+```python
+# Encode + sign + submit in one call
+result = client.submit(PlaceOrder(
+    market=1,
+    owner=bytes.fromhex("<owner-hex>"),
+    side=Side.Buy,
+    price=50_000_000,   # micro-USDC per contract
+    quantity=10,
+    time_in_force=TimeInForce.Gtc,
+))
+
+# Or sign manually and submit the raw envelope bytes
+envelope = client.sign_action(action)
+result = client.submit_action(envelope)
+```
+
+**Query methods**
+
+```python
+account  = client.account()                 # AccountState: balances, positions, open_orders
+orders   = client.open_orders(owner_bytes)
+markets  = client.markets()
+book     = client.orderbook(market_id)
+ticker   = client.ticker(market_id)         # → dict | None
+health   = client.health()
+status   = client.status()
+
+# History (time-windowed)
+deposits     = client.history_deposits(owner_bytes, from_ms=..., to_ms=..., limit=100)
+withdrawals  = client.history_withdrawals(owner_bytes)
+resolutions  = client.history_resolutions(owner_bytes, impact_market_id=5)
+
+# Cursor-paginated history
+fills_page   = client.history_fills(owner_bytes, limit=50)
+funding_page = client.history_funding(owner_bytes)
+```
+
+---
+
+## Basic usage example
+
+The following example connects to devnet, derives an owner address, and places a limit buy order:
+
+```python
+import os
+from proof_trading_sdk import (
+    ExchangeClient,
+    generate_keypair,
+    pubkey_to_owner,
+    chain_id_from_string,
+    PlaceOrder,
+    Side,
+    TimeInForce,
+)
+
+# 1. Load or generate a keypair
+seed = bytes.fromhex(os.environ["PROOF_PRIVATE_KEY"])
+kp = generate_keypair(seed)
+owner = pubkey_to_owner(kp["public_key"])
+
+# 2. Resolve the chain ID (or pin it explicitly)
+chain_id = chain_id_from_string("proof-devnet-1")
+
+# 3. Build the client
+client = ExchangeClient(
+    gateway_url="https://api.dev.proof.trade",
+    api_key=os.environ.get("PROOF_API_KEY", ""),
+    secret_key=seed,
+    chain_id=chain_id,
+)
+
+# 4. Check connectivity
+print(client.health())
+
+# 5. Place a limit buy on market 1
+result = client.submit(PlaceOrder(
+    market=1,
+    owner=owner,
+    side=Side.Buy,
+    price=50_000_000,   # 50.00 USDC in micro-units
+    quantity=1,
+    time_in_force=TimeInForce.Gtc,
+))
+
+print(result)   # {"code": 0, "tx_hash": "...", ...}
+```
+
+---
+
+## Hardware-isolated key path
+
+For production deployments where the signing key must never reside in Python memory, use `load_key_from_fd` to hand the SDK a file descriptor containing the raw key bytes. The key is read and stored entirely in Rust; Python receives only an opaque `SigningHandle`.
+
+```python
+from proof_trading_sdk import ExchangeClient, load_key_from_fd
+import os
+
+# Open the key file and pass the fd number — never read the bytes in Python
+key_fd = os.open("/run/secrets/proof_signing_key", os.O_RDONLY)
+handle = load_key_from_fd(key_fd)
+os.close(key_fd)
+
+client = ExchangeClient(
+    gateway_url="https://api.dev.proof.trade",
+    key_handle=handle,   # key_handle takes precedence over secret_key
+    chain_id=chain_id,
+)
+
+# Signing happens entirely in Rust — the key never touches Python's heap
+result = client.submit(action)
+```
+
+Pass `key_handle=handle` instead of `secret_key=`. When both are set, `key_handle` takes precedence. The `SigningHandle.sign_and_encode()` method accepts `(chain_id, action_type, payload, seq)` and returns the signed wire envelope bytes without ever surfacing key material to the Python layer.

@@ -1,0 +1,169 @@
+---
+title: "Offline Transaction Signing and Raw Wire Encoding"
+sidebarTitle: "Offline Signing"
+description: "Build and inspect signed wire envelopes directly — ideal for air-gapped key stores, custom gateway integrations, and cross-language conformance testing."
+---
+
+Proof transactions are self-contained binary envelopes: a MessagePack array carrying the action type, a timestamp nonce, a MessagePack-encoded payload, the signer's Ed25519 public key, and a 64-byte signature. The `ExchangeClient` assembles and submits these automatically, but the SDK also exports the raw codec layer so you can build envelopes by hand, inspect bytes in flight, bridge to an air-gapped signing device, or verify byte-for-byte compatibility with the Rust reference implementation.
+
+## Codec exports
+
+The following functions are exported directly from `@proof/trading-sdk`:
+
+| Function | Signature | Purpose |
+|---|---|---|
+| `fetchChainId` | `(rpcUrl: string) => Promise<Uint8Array>` | Resolve a 32-byte chain ID from CometBFT `/status` over the network |
+| `chainIdFromString` | `(chainId: string) => Uint8Array` | Hash a chain ID string to 32 bytes without a network call |
+| `signAndEncode` | `(chainId, action, seq, privateKey) => Uint8Array` | Build a complete signed wire envelope |
+| `decodeTx` | `(bytes: Uint8Array) => { version, action, seq, pubkey, signature }` | Decode and verify the structure of a wire envelope |
+| `encodePayloadBytes` | `(action: Action) => Uint8Array` | Encode only the action payload, with no signature wrapper |
+| `peekActionType` | `(bytes: Uint8Array) => ActionTypeValue \| null` | Read the action type byte without a full decode |
+| `signEnvelopeFromPayload` | `(chainId, actionType, seq, payloadBytes, privateKey) => Uint8Array` | Sign and wrap pre-encoded payload bytes — useful for cross-language conformance |
+
+## Complete offline signing flow
+
+```typescript
+import {
+  signAndEncode,
+  decodeTx,
+  fetchChainId,
+  chainIdFromString,
+  encodePayloadBytes,
+  peekActionType,
+} from "@proof/trading-sdk";
+import type { Action } from "@proof/trading-sdk";
+
+// Option A: resolve the chain ID from the network (recommended for production)
+const chainId = await fetchChainId("https://api.dev.proof.trade");
+
+// Option B: derive the same bytes offline — no network call needed
+const chainIdOffline = chainIdFromString("exchange-devnet-1");
+
+// Build your action
+const action: Action = {
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: ownerAddress, // Uint8Array (20 bytes)
+    side: Side.Buy,
+    price: 50000000n,    // $500,000.00 in cents
+    quantity: 1n,
+  },
+};
+
+// seq is a millisecond Unix timestamp nonce
+const seq = BigInt(Date.now());
+
+// Sign and encode into a complete wire envelope
+const txBytes = signAndEncode(chainId, action, seq, privateKey);
+
+// Inspect the envelope — verifies wire layout without submitting
+const decoded = decodeTx(txBytes);
+// decoded.version    → 2
+// decoded.action     → the original Action object, round-tripped through msgpack
+// decoded.seq        → seq (bigint)
+// decoded.pubkey     → Uint8Array (32 bytes) — Ed25519 public key
+// decoded.signature  → Uint8Array (64 bytes) — Ed25519 signature
+
+// Peek at the action type without a full decode
+const actionType = peekActionType(txBytes); // e.g. 0x01 for PlaceOrder
+
+// Inspect just the payload bytes (for cross-language conformance testing)
+const payloadBytes = encodePayloadBytes(action);
+```
+
+The resulting `txBytes` is ready to `POST` directly to the gateway's `/exchange` endpoint or to `broadcast_tx_sync` on CometBFT. `ExchangeClient.submitTx()` does exactly this under the hood.
+
+## Wire envelope format
+
+The V2 envelope is a MessagePack positional array with six fields:
+
+```
+[version(1B int), actionType(1B int), seq(u64), payloadBytes(bin), pubkey(32B bin), signature(64B bin)]
+```
+
+Specifically, wire index 0 is always `2` (the envelope version). The payload bytes at index 3 are themselves a MessagePack array whose element order matches the Rust struct field declaration order in `exchange-core`. Field ordering is the wire contract — inserting or reordering a field is a breaking change.
+
+## V3 signing message layout
+
+The signature covers a deterministic byte string assembled by `signingMessage()` in `src/crypto.ts`:
+
+```
+DOMAIN_PREFIX(16B) || chain_id(32B) || action_type(1B) || seq_be(8B) || payload
+```
+
+| Segment | Size | Value |
+|---|---|---|
+| `DOMAIN_PREFIX` | 16 bytes | ASCII string `"ProofExchange-v3"` |
+| `chain_id` | 32 bytes | `keccak256(cometbft_chain_id_string)` |
+| `action_type` | 1 byte | Wire action type constant (e.g. `0x01`) |
+| `seq_be` | 8 bytes | Timestamp nonce as big-endian uint64 |
+| `payload` | variable | MessagePack-encoded action payload |
+
+The domain prefix was bumped from `v2` to `v3` on 2026-04-23 when the 32-byte `chain_id` binding was introduced. A signature produced under the old prefix fails verification against a `v3` engine, preventing cross-version replays.
+
+## Chain ID binding
+
+`chainIdFromString` computes `keccak256(UTF-8(chainIdString))` — identical to the Rust `chain_id_from_string` in `crypto.rs`. You can derive the chain ID entirely offline as long as you know the CometBFT chain ID string:
+
+```typescript
+import { chainIdFromString } from "@proof/trading-sdk";
+
+const chainId = chainIdFromString("exchange-devnet-1");
+// 32-byte Uint8Array, equal to what fetchChainId returns from the devnet
+```
+
+`fetchChainId` is a convenience wrapper that calls `/status` on the CometBFT RPC endpoint, parses the `node_info.network` field, and passes it through `chainIdFromString`. Use it when you want to avoid hardcoding the chain ID, but the two paths are byte-for-byte equivalent for a known chain.
+
+## UNBOUND_CHAIN_ID
+
+The SDK exports a 32-byte all-zeros constant called `UNBOUND_CHAIN_ID`:
+
+```typescript
+import { UNBOUND_CHAIN_ID } from "@proof/trading-sdk";
+// new Uint8Array(32) — every byte is 0x00
+```
+
+<Warning>
+  `UNBOUND_CHAIN_ID` is intended for unit tests and offline conformance checks
+  only. A signature produced with an all-zeros chain ID is valid on **any**
+  deployment that also accepts `UNBOUND_CHAIN_ID` — it provides no chain
+  binding and is trivially replayable. Never submit a transaction signed with
+  `UNBOUND_CHAIN_ID` to a production endpoint.
+</Warning>
+
+## Nonce (seq) semantics
+
+The `seq` field is a millisecond Unix timestamp. Use `BigInt(Date.now())` and ensure nonces are strictly increasing across calls:
+
+```typescript
+// Safe nonce allocation — mirror what ExchangeClient does internally
+let lastSeq = 0n;
+
+function nextSeq(): bigint {
+  const now = BigInt(Date.now());
+  lastSeq = now > lastSeq ? now : lastSeq + 1n;
+  return lastSeq;
+}
+
+const txBytes = signAndEncode(chainId, action, nextSeq(), privateKey);
+```
+
+The engine validates `seq` against a per-account sliding window. Duplicate or stale nonces are rejected with error code `21` (`InvalidNonce`). The SDK's `ExchangeClient` manages this allocation automatically; you only need to track it yourself when calling `signAndEncode` directly.
+
+## Relaying pre-signed bytes
+
+Once you hold a `txBytes` buffer you can relay it to any compatible gateway without possessing the private key:
+
+```typescript
+// Air-gapped signer produces txBytes, then hands them to an online relay process
+const response = await fetch("https://api.dev.proof.trade/exchange", {
+  method: "POST",
+  headers: { "Content-Type": "application/octet-stream" },
+  body: txBytes,
+});
+const result = await response.json();
+// { code: 0, hash: "…" } on success
+```
+
+This pattern is useful when the signing device cannot reach the internet directly: the signer builds and signs the envelope offline, and a separate, network-connected relay process forwards the opaque bytes.

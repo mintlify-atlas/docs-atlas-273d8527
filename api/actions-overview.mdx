@@ -1,0 +1,210 @@
+---
+title: "Exchange Actions: The Full Action Type Union"
+sidebarTitle: "Actions Overview"
+description: "A complete reference for the Proof Exchange Action discriminated union — wire bytes, enums, categories, and how to submit any action via submitTx."
+---
+
+Every mutation sent to the Proof Exchange — placing an order, depositing funds, updating oracle prices, creating a market — is represented as a member of the `Action` discriminated union. Actions always carry the shape `{ type: string, data: object }`, where `type` is a human-readable string selector and `data` is the typed payload for that action. Under the hood each action maps to a single wire byte (defined in the `ActionType` constant object) that the encoder writes into the MessagePack envelope before signing. Understanding this union is the starting point for everything you can do with the SDK.
+
+## The `Action` Type
+
+```typescript
+export type Action =
+  | { type: "PlaceOrder";           data: PlaceOrder }
+  | { type: "CancelOrder";          data: CancelOrder }
+  | { type: "CancelClientOrder";    data: CancelClientOrder }
+  | { type: "CancelAllOrders";      data: CancelAllOrders }
+  | { type: "CancelReplaceOrder";   data: CancelReplaceOrder }
+  | { type: "AmendOrder";           data: AmendOrder }
+  | { type: "AtomicBasketOrder";    data: AtomicBasketOrder }
+  | { type: "OracleUpdate";         data: OracleUpdate }
+  | { type: "MarketOrder";          data: MarketOrder }
+  | { type: "Deposit";              data: Deposit }
+  | { type: "Withdraw";             data: Withdraw }
+  | { type: "CreateMarket";         data: CreateMarket }
+  | { type: "WithdrawRequest";      data: WithdrawRequest }
+  | { type: "ConfirmDeposit";       data: ConfirmDeposit }
+  | { type: "ConfirmWithdrawal";    data: ConfirmWithdrawal }
+  | { type: "FailWithdrawal";       data: FailWithdrawal }
+  | { type: "ApproveAgent";         data: ApproveAgent }
+  | { type: "RevokeAgent";          data: RevokeAgent }
+  | { type: "CreateImpactMarket";   data: CreateImpactMarket }
+  | { type: "ResolveEvent";         data: ResolveEvent }
+  | { type: "UpdateMarketFees";     data: UpdateMarketFees }
+  | { type: "SetUserMarketLeverage"; data: SetUserMarketLeverage }
+  | { type: "ClosePosition";        data: ClosePosition };
+```
+
+Pass any `Action` value directly to `client.submitTx()` — the SDK signs, encodes, and broadcasts it for you:
+
+```typescript
+const result = await client.submitTx({
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: address, // pubkeyToOwner(publicKey)
+    side: Side.Buy,
+    price: 6675234n, // $66,752.34 in integer cents
+    quantity: 1n,
+  },
+});
+
+if (result.code !== 0) {
+  throw new Error(`Action failed: code=${result.code} log=${result.log}`);
+}
+```
+
+---
+
+## ActionType Wire Bytes
+
+The `ActionType` constant maps every action name to its single-byte wire identifier. These values are embedded in the signed MessagePack envelope and must never change for a deployed chain.
+
+```typescript
+export const ActionType = {
+  PlaceOrder:            0x01,
+  CancelOrder:           0x02,
+  OracleUpdate:          0x03,
+  MarketOrder:           0x04,
+  Deposit:               0x05,
+  Withdraw:              0x06,
+  CreateMarket:          0x07,
+  WithdrawRequest:       0x08,
+  ConfirmDeposit:        0x09,
+  ConfirmWithdrawal:     0x0a,
+  FailWithdrawal:        0x0b,
+  ApproveAgent:          0x0c,
+  RevokeAgent:           0x0d,
+  CreateImpactMarket:    0x0e,
+  ResolveEvent:          0x0f,
+  UpdateMarketFees:      0x10,
+  SetUserMarketLeverage: 0x16,
+  ClosePosition:         0x17,
+  CancelClientOrder:     0x18,
+  CancelAllOrders:       0x19,
+  CancelReplaceOrder:    0x1a,
+  AmendOrder:            0x1b,
+  AtomicBasketOrder:     0x1c,
+} as const;
+```
+
+---
+
+## All Actions at a Glance
+
+| Type String | Wire Byte | Description |
+|---|---|---|
+| `PlaceOrder` | `0x01` | Place a resting limit order on the book |
+| `CancelOrder` | `0x02` | Cancel a resting order by engine-assigned ID |
+| `OracleUpdate` | `0x03` | Submit an oracle price update (relayer only) |
+| `MarketOrder` | `0x04` | Place an immediate-or-cancel crossing order |
+| `Deposit` | `0x05` | Credit USDC to an account (relayer/dev; prefer `ConfirmDeposit`) |
+| `Withdraw` | `0x06` | Debit USDC from an account, checking margin (relayer) |
+| `CreateMarket` | `0x07` | Register a new perpetual market with risk parameters (admin) |
+| `WithdrawRequest` | `0x08` | User initiates a USDC withdrawal to a Solana address |
+| `ConfirmDeposit` | `0x09` | Relayer confirms an on-chain Solana USDC deposit |
+| `ConfirmWithdrawal` | `0x0a` | Relayer confirms a USDC withdrawal was sent on Solana |
+| `FailWithdrawal` | `0x0b` | Relayer marks a withdrawal permanently failed; refunds balance |
+| `ApproveAgent` | `0x0c` | Approve a delegate wallet to trade on the owner's behalf |
+| `RevokeAgent` | `0x0d` | Revoke a previously approved agent wallet |
+| `CreateImpactMarket` | `0x0e` | Create a 5-book impact-market family (admin) |
+| `ResolveEvent` | `0x0f` | Resolve an impact-market event with an outcome (relayer) |
+| `UpdateMarketFees` | `0x10` | Update live market config tunables without a chain rebase (relayer) |
+| `SetUserMarketLeverage` | `0x16` | Set a per-account initial-margin override for one market |
+| `ClosePosition` | `0x17` | Close an entire position via opposite-side IOC at oracle±spread |
+| `CancelClientOrder` | `0x18` | Cancel a resting order by owner-scoped client order ID |
+| `CancelAllOrders` | `0x19` | Cancel all resting orders for an account (optionally per-market) |
+| `CancelReplaceOrder` | `0x1a` | Atomically cancel one resting order and place a replacement |
+| `AmendOrder` | `0x1b` | Amend price or quantity on a resting order in place |
+| `AtomicBasketOrder` | `0x1c` | Native all-or-revert multi-leg basket order |
+
+---
+
+## Shared Enums
+
+These enums are used across multiple action types and are imported from the same `types.ts` module.
+
+### `Side`
+
+```typescript
+export enum Side {
+  /** Buy / long. */
+  Buy  = 1,
+  /** Sell / short. */
+  Sell = 2,
+}
+```
+
+### `TimeInForce`
+
+Controls how unmatched quantity is handled after crossing the book. Wire-encoded as the variant name string.
+
+```typescript
+export enum TimeInForce {
+  /** Good-Till-Cancelled: unmatched quantity rests on the book. The default. */
+  Gtc = 0,
+  /** Immediate-Or-Cancel: unmatched quantity is dropped after crossing. */
+  Ioc = 1,
+  /** Fill-Or-Kill: fully fill immediately or reject without mutation. */
+  Fok = 2,
+}
+```
+
+---
+
+## User Actions vs. Relayer / Admin Actions
+
+Actions fall into two broad authorization tiers. The envelope signer's derived address is checked against the action's intent — the engine rejects any mismatch.
+
+### User-Signed Actions
+
+These actions are signed by the account owner (or an approved agent). Any client with a valid Ed25519 keypair and sufficient margin can submit them.
+
+| Action | Notes |
+|---|---|
+| `PlaceOrder` | Limit order; `owner` must match envelope signer |
+| `MarketOrder` | Immediate-or-cancel crossing order |
+| `CancelOrder` | Cancel by engine order ID |
+| `CancelClientOrder` | Cancel by client order ID |
+| `CancelAllOrders` | Bulk cancel, optionally scoped to one market |
+| `CancelReplaceOrder` | Atomic cancel + replace |
+| `AmendOrder` | In-place price/quantity change |
+| `ClosePosition` | IOC close at oracle±spread; `owner` must equal signer |
+| `AtomicBasketOrder` | Multi-leg fill-or-kill; `owner` must equal signer |
+| `WithdrawRequest` | Initiates a Solana withdrawal; debits balance immediately |
+| `ApproveAgent` | Grants trading delegation to a 32-byte Ed25519 pubkey |
+| `RevokeAgent` | Revokes a delegation |
+| `SetUserMarketLeverage` | Sets a per-market IM override; `owner` must equal signer |
+
+### Relayer / Admin Actions
+
+These actions require the envelope signer's derived address to be on the engine's on-chain relayer or admin allowlist. Unauthorized signers receive `UnauthorizedRelayer`.
+
+| Action | Tier | Notes |
+|---|---|---|
+| `OracleUpdate` | Relayer | Must use an authorized oracle signer; `publishTimeMs` strictly increasing |
+| `Deposit` | Relayer | Legacy credit action; prefer `ConfirmDeposit` for production |
+| `Withdraw` | Relayer | Direct debit; checks margin requirements |
+| `ConfirmDeposit` | Relayer | Tied to a Solana tx signature for idempotency |
+| `ConfirmWithdrawal` | Relayer | Marks a pending withdrawal as completed |
+| `FailWithdrawal` | Relayer | Marks a pending withdrawal as failed; refunds the debited balance |
+| `UpdateMarketFees` | Relayer | Live market config updates without a chain rebase |
+| `ResolveEvent` | Relayer | Resolves an impact-market event; auto-verified when `oracleSource` is set |
+| `CreateMarket` | Admin | Registers a new perpetual market; `szDecimals` and `ticker` are mandatory |
+| `CreateImpactMarket` | Admin | Creates a 5-book impact-market family |
+
+---
+
+## Detail Pages
+
+<CardGroup cols={3}>
+  <Card title="Order Actions" href="/api/order-actions">
+    PlaceOrder, CancelOrder, MarketOrder, ClosePosition, AtomicBasketOrder, and more
+  </Card>
+  <Card title="Account Actions" href="/api/account-actions">
+    Leverage, agent delegation, deposits, and withdrawal flows
+  </Card>
+  <Card title="Admin Actions" href="/api/admin-actions">
+    OracleUpdate, CreateMarket, UpdateMarketFees, CreateImpactMarket, ResolveEvent
+  </Card>
+</CardGroup>

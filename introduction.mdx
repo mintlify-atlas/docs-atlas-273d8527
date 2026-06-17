@@ -1,0 +1,118 @@
+---
+title: "Proof Trading SDK: Exchange Actions Over HTTP"
+sidebarTitle: "Introduction"
+description: "The Proof Trading SDK lets you sign, encode, and submit trading actions to the Proof Exchange over HTTP—no blockchain node required."
+---
+
+The Proof Trading SDK is a first-party client library for the [Proof Exchange](https://proof.trade), a CometBFT-based perpetuals exchange. It handles every layer between your application and the on-chain engine: Ed25519 key generation and signing, MessagePack wire encoding, monotonic timestamp-nonce allocation, and both gateway and direct CometBFT broadcast. Whether you are building a trading bot, an AI agent, or a full-featured frontend, every exchange action flows through a single `submitTx` call.
+
+## What the SDK does
+
+The SDK packages four responsibilities into one cohesive interface:
+
+- **Ed25519 signing** — generate a keypair locally, derive a 20-byte owner address via `pubkeyToOwner`, and attach a domain-separated signature to every transaction.
+- **MessagePack wire encoding** — transactions are compact positional arrays (`[version, action_type, seq, payload, pubkey, signature]`) encoded with MessagePack, not JSON.
+- **Timestamp-nonce allocation** — `seq` is a millisecond Unix timestamp advanced by `max(now_ms, last_nonce + 1)`. The exchange validates against a sliding window and rejects replays with code `21`.
+- **Gateway and CometBFT submission** — by default, transactions POST to the gateway's `/exchange` endpoint; set `useGateway: false` to broadcast directly to CometBFT's `broadcast_tx_sync`.
+
+Beyond trading, the SDK exposes a full query surface: orderbooks, open orders, account balances and positions, market configs, tickers, history, and real-time block events over WebSocket.
+
+## Available packages
+
+<CardGroup cols={3}>
+  <Card title="TypeScript / Node.js" icon="npm">
+    ```bash
+    npm install @proof/trading-sdk
+    ```
+    Pure TypeScript, ESM module. Requires Node.js 18+.
+  </Card>
+  <Card title="Python" icon="python">
+    ```bash
+    pip install proof-trading-sdk
+    ```
+    Backed by a compiled Rust core via PyO3. See `python/pyproject.toml`.
+  </Card>
+  <Card title="Rust" icon="rust">
+    ```toml
+    proof-trading-sdk = "*"
+    ```
+    Native crate at `crates/proof-trading-sdk`.
+  </Card>
+</CardGroup>
+
+## Devnet defaults
+
+The SDK ships pre-configured for the public Proof devnet. No additional setup is required to start querying.
+
+| Parameter   | Default                          |
+| ----------- | -------------------------------- |
+| Gateway URL | `https://api.dev.proof.trade`    |
+| Chain ID    | `exchange-devnet-1`              |
+| Faucet URL  | `https://faucet.dev.proof.trade` |
+
+Connecting to devnet requires only a `chainId`:
+
+```typescript
+import { ExchangeClient } from "@proof/trading-sdk";
+
+const client = new ExchangeClient({ chainId: "exchange-devnet-1" });
+const health = await client.queryHealth();
+// { status: "ok", height: 123456 }
+```
+
+## Key capabilities at a glance
+
+<CardGroup cols={2}>
+  <Card title="Trading actions" icon="arrow-right-arrow-left">
+    Place, cancel, replace, and amend limit orders. Execute market orders, close positions, and submit atomic basket (multi-leg) orders — all via a single discriminated-union `Action` type.
+  </Card>
+  <Card title="Full query surface" icon="magnifying-glass">
+    Query orderbooks, open orders, account info, market configs, tickers, chain status, ADL queues, and withdrawal records without any authentication.
+  </Card>
+  <Card title="Submission modes" icon="paper-plane">
+    `submitTx` returns after CheckTx (fire-and-forget with background polling). `submitTxCommit` polls `/tx?hash` for up to 9 seconds for synchronous confirmation.
+  </Card>
+  <Card title="WebSocket events" icon="bolt">
+    Subscribe to real-time block events — trades, order placements, position updates, funding, and liquidations — via `client.subscribeBlocks()` or the raw `wss://` feed.
+  </Card>
+</CardGroup>
+
+## Wire format overview
+
+Transactions are MessagePack positional arrays signed over a domain-separated message:
+
+```
+[2, action_type, seq, payload, pubkey(32B), signature(64B)]
+```
+
+The signature covers `DOMAIN_PREFIX(16B) || chain_id(32B) || action_type(1B) || seq(8B BE) || payload`. The 32-byte `chain_id` binding closes the cross-chain replay vector. Full payload layouts are defined in `src/types.ts` and `src/codec.ts`.
+
+<Note>
+  Prices and quantities are always `bigint` (`u64`) — never JavaScript `number` or floating point. Prices are integer cents (`5000000n` = $50,000.00) and balances are microUSDC (`10_000_000_000n` = $10,000).
+</Note>
+
+## Unit conventions
+
+| Field               | Unit             | Example                            |
+| ------------------- | ---------------- | ---------------------------------- |
+| Prices              | Integer cents    | `5000000n` = $50,000.00            |
+| Balances / amounts  | MicroUSDC (6 dp) | `10_000_000_000n` = $10,000        |
+| Fees / margin rates | Basis points     | `500` = 5%                         |
+| Addresses           | 20-byte `Uint8Array` | `pubkeyToOwner(publicKey)`     |
+
+## Explore further
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Generate a keypair, fund via faucet, and place your first limit order in under five minutes.
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    TypeScript, Python, and Rust setup with runtime requirements and connectivity tests.
+  </Card>
+  <Card title="ExchangeClient API" icon="code" href="/api/exchange-client">
+    Full reference for all client methods, options, and return types.
+  </Card>
+  <Card title="Key Management" icon="key" href="/concepts/key-management">
+    Ed25519 keypair generation, address derivation, and secure key handling patterns.
+  </Card>
+</CardGroup>

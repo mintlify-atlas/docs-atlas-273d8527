@@ -1,0 +1,487 @@
+---
+title: "Streaming Real-Time Exchange Events via WebSocket"
+sidebarTitle: "Real-Time Events"
+description: "Subscribe to live order, trade, position, and funding events from the Proof Exchange using the SDK's WebSocket integration or the direct multiplexed feed."
+---
+
+The Proof Exchange emits a structured stream of typed events for every significant state change — order placements, trade executions, position updates, funding settlements, liquidations, and more. You can receive these events through the SDK's built-in CometBFT WebSocket subscription, or by connecting directly to the gateway's multiplexed WebSocket feed.
+
+---
+
+## SDK WebSocket Subscription
+
+`client.subscribeBlocks(onEvent)` connects to the CometBFT WebSocket endpoint, subscribes to both `NewBlock` and `Tx` events, and delivers raw event objects to your callback. It returns an **unsubscribe function** you call to stop receiving events.
+
+```typescript
+import { ExchangeClient, generateKeypair, pubkeyToOwner } from "@proof/trading-sdk";
+
+const { publicKey, privateKey } = generateKeypair();
+const address = pubkeyToOwner(publicKey);
+
+const client = new ExchangeClient({ chainId: "exchange-devnet-1" });
+client.setPrivateKey(privateKey);
+
+// Subscribe — returns an unsubscribe handle
+const unsub = client.subscribeBlocks((event) => {
+  console.log("Received event:", event);
+});
+
+// Later — stop receiving events
+unsub();
+
+// Disconnect the WebSocket entirely (includes exponential-backoff reconnect)
+client.disconnect();
+```
+
+The WebSocket reconnects automatically with exponential backoff (2 s, 4 s, 8 s … up to 60 s with ±25% jitter) if the connection drops while listeners remain registered. Calling `unsub()` for the last listener stops reconnection attempts; `client.disconnect()` closes the socket immediately.
+
+---
+
+## Direct Gateway Feed
+
+For lower latency or custom subscription logic, connect directly to the gateway's multiplexed WebSocket endpoint:
+
+```
+wss://api.dev.proof.trade/ws
+```
+
+```typescript
+const ws = new WebSocket("wss://api.dev.proof.trade/ws");
+
+ws.onopen = () => console.log("Connected to Proof gateway feed");
+
+ws.onmessage = (msg) => {
+  const event = JSON.parse(msg.data);
+  handleEvent(event);
+};
+
+ws.onclose = () => console.log("Disconnected");
+```
+
+<Note>
+  The gateway multiplexed feed (`/ws`) delivers the same exchange events as the CometBFT WebSocket but through a single connection managed by the gateway. Use this path when you need minimal overhead or are building a server-side aggregator.
+</Note>
+
+---
+
+## The ExchangeEvent Union Type
+
+Every event has a `type` discriminant field. The complete `ExchangeEvent` union covers all engine-emitted events:
+
+```typescript
+type ExchangeEvent =
+  | OrderPlacedEvent
+  | OrderCancelledEvent
+  | TradeExecutedEvent
+  | FeesCollectedEvent
+  | DepositedEvent
+  | WithdrawnEvent
+  | PositionUpdatedEvent
+  | PositionClosedEvent
+  | PriceUpdatedEvent
+  | MarketCreatedEvent
+  | AccountLiquidatedEvent
+  | FundingAppliedEvent
+  | FundingSettledEvent
+  | AgentApprovedEvent
+  | AgentRevokedEvent
+  | MarketOrderProcessedEvent
+  | OrderbookLevelUpdatedEvent;
+```
+
+<Warning>
+  All numeric fields on event objects are **stringified numbers** — they arrive as `string`, not `number` or `bigint`. Parse them with `BigInt(event.price)` or `Number(event.market)` as appropriate.
+</Warning>
+
+---
+
+## Event Reference
+
+### OrderPlacedEvent
+
+Emitted when a limit order is accepted onto the book.
+
+```typescript
+interface OrderPlacedEvent {
+  type: "OrderPlaced";
+  orderId: string;       // engine-assigned order ID
+  market: string;        // market identifier
+  owner: string;         // hex-encoded owner address
+  side: string;          // "Buy" or "Sell"
+  price: string;         // limit price in cents
+  quantity: string;      // quantity in contracts
+  clientOrderId: string; // client ID, or "0" if absent
+}
+```
+
+---
+
+### OrderCancelledEvent
+
+Emitted when a resting order is cancelled — by user request, IOC expiry, or liquidation.
+
+```typescript
+interface OrderCancelledEvent {
+  type: "OrderCancelled";
+  orderId: string;
+  market: string;
+  owner: string;
+  reason: string;            // e.g. "user_requested", "liquidation"
+  clientOrderId: string;     // or "0"
+  originalQuantity: string;  // quantity accepted onto the book
+  remainingQuantity: string; // quantity resting when cancelled
+  filledQuantity: string;    // cumulative maker fills before cancellation
+}
+```
+
+---
+
+### TradeExecutedEvent
+
+Emitted once per fill between a maker and a taker.
+
+```typescript
+interface TradeExecutedEvent {
+  type: "TradeExecuted";
+  fillId: string;
+  market: string;
+  price: string;              // execution price in cents
+  quantity: string;           // fill quantity in contracts
+  makerOrderId: string;
+  makerClientOrderId: string; // or "0"
+  makerOwner: string;
+  makerSide: string;          // "Buy" or "Sell"
+  takerOwner: string;
+  takerClientOrderId: string; // or "0"
+  takerFee: string;           // microUSDC (non-negative)
+  makerFee: string;           // microUSDC (non-negative)
+}
+```
+
+---
+
+### FeesCollectedEvent
+
+Emitted alongside every `TradeExecuted` to summarize the net fee transfer.
+
+```typescript
+interface FeesCollectedEvent {
+  type: "FeesCollected";
+  market: string;
+  takerOwner: string;
+  takerFee: string;   // signed microUSDC (negative = rebate)
+  makerOwner: string;
+  makerFee: string;   // signed microUSDC (negative = rebate)
+}
+```
+
+---
+
+### PositionUpdatedEvent
+
+Emitted whenever a position's size or entry price changes due to a fill.
+
+```typescript
+interface PositionUpdatedEvent {
+  type: "PositionUpdated";
+  owner: string;
+  market: string;
+  side: string;        // "Buy" = long, "Sell" = short
+  entryPrice: string;  // weighted-average entry price in cents
+  size: string;        // absolute size in contracts
+}
+```
+
+---
+
+### PositionClosedEvent
+
+Emitted when a position reaches zero size.
+
+```typescript
+interface PositionClosedEvent {
+  type: "PositionClosed";
+  owner: string;
+  market: string;
+  realizedPnl: string; // signed microUSDC (positive = profit)
+}
+```
+
+---
+
+### MarketOrderProcessedEvent
+
+Emitted once per market-order transaction as the authoritative fill summary.
+
+```typescript
+interface MarketOrderProcessedEvent {
+  type: "MarketOrderProcessed";
+  market: string;
+  owner: string;
+  side: string;
+  requestedQuantity: string; // quantity originally requested
+  filledQuantity: string;    // quantity actually filled
+  clientOrderId?: string;    // if a client ID was provided
+}
+```
+
+| Outcome | Condition |
+|---|---|
+| Full fill | `filledQuantity === requestedQuantity` |
+| Partial fill | `0 < filledQuantity < requestedQuantity` |
+| No fill | `filledQuantity === "0"` |
+
+<Note>
+  `MarketOrderProcessed` is the definitive "did my market order fill?" signal. Without it, you'd have to count `TradeExecuted` events, which may arrive out of order in multi-stream setups.
+</Note>
+
+---
+
+### FundingAppliedEvent
+
+Emitted at each funding interval for a market.
+
+```typescript
+interface FundingAppliedEvent {
+  type: "FundingApplied";
+  market: string;
+  fundingRateBps: string;    // signed bps (positive = longs pay shorts)
+  cumulativeFunding: string; // cumulative funding index after this tick
+  timestampMs: string;       // block timestamp in milliseconds
+}
+```
+
+---
+
+### FundingSettledEvent
+
+Emitted once per open position at each funding tick.
+
+```typescript
+interface FundingSettledEvent {
+  type: "FundingSettled";
+  owner: string;
+  market: string;
+  payment: string; // signed microUSDC (positive = received, negative = paid)
+}
+```
+
+---
+
+### AccountLiquidatedEvent
+
+Emitted when a position is liquidated due to insufficient maintenance margin.
+
+```typescript
+interface AccountLiquidatedEvent {
+  type: "AccountLiquidated";
+  owner: string;
+  market: string;
+  side: string;
+  size: string;        // size liquidated in contracts
+  markPrice: string;   // mark price at liquidation in cents
+  realizedPnl: string; // signed realized PnL in microUSDC
+}
+```
+
+---
+
+### OrderbookLevelUpdatedEvent
+
+Emitted after any mutation to a price level — absolute post-mutation state.
+
+```typescript
+interface OrderbookLevelUpdatedEvent {
+  type: "OrderbookLevelUpdated";
+  market: string;
+  side: string;          // "Buy" or "Sell"
+  price: string;         // price level in micro-USDC
+  totalQuantity: string; // total resting quantity at this level
+  orderCount: string;    // resting order count at this level
+}
+```
+
+---
+
+### PriceUpdatedEvent
+
+Emitted when the oracle price is updated for a market.
+
+```typescript
+interface PriceUpdatedEvent {
+  type: "PriceUpdated";
+  market: string;
+  price: string; // new oracle price in cents (2 dp)
+}
+```
+
+---
+
+### AgentApprovedEvent / AgentRevokedEvent
+
+Emitted when a delegate agent wallet is approved or revoked.
+
+```typescript
+interface AgentApprovedEvent {
+  type: "AgentApproved";
+  owner: string;       // hex-encoded owner
+  agent: string;       // hex-encoded agent address
+  agentPubkey: string; // hex-encoded Ed25519 public key (32 bytes)
+}
+
+interface AgentRevokedEvent {
+  type: "AgentRevoked";
+  owner: string;
+  agent: string;
+  agentPubkey: string;
+}
+```
+
+---
+
+## Complete Event Handler Pattern
+
+A robust handler switches on `event.type` and handles each variant explicitly. Filter for the events you care about and ignore the rest.
+
+```typescript
+import type { ExchangeEvent } from "@proof/trading-sdk";
+
+const myAddressHex = client.getAddressHex()!;
+
+const unsub = client.subscribeBlocks((raw) => {
+  // The SDK delivers raw CometBFT event data — cast to ExchangeEvent
+  const event = raw as unknown as ExchangeEvent;
+
+  switch (event.type) {
+    case "OrderPlaced": {
+      if (event.owner === myAddressHex) {
+        console.log(`Order placed: id=${event.orderId} price=${event.price} qty=${event.quantity}`);
+      }
+      break;
+    }
+
+    case "OrderCancelled": {
+      if (event.owner === myAddressHex) {
+        console.log(`Order cancelled: id=${event.orderId} reason=${event.reason}`);
+      }
+      break;
+    }
+
+    case "TradeExecuted": {
+      const involvedMe = event.makerOwner === myAddressHex || event.takerOwner === myAddressHex;
+      if (involvedMe) {
+        const isMaker = event.makerOwner === myAddressHex;
+        const fee = isMaker ? event.makerFee : event.takerFee;
+        console.log(
+          `Trade: market=${event.market} price=${event.price} qty=${event.quantity} ` +
+          `role=${isMaker ? "maker" : "taker"} fee=${fee}µUSDC`
+        );
+      }
+      break;
+    }
+
+    case "MarketOrderProcessed": {
+      if (event.owner === myAddressHex) {
+        const filled = BigInt(event.filledQuantity);
+        const requested = BigInt(event.requestedQuantity);
+        if (filled === requested) {
+          console.log(`Market order fully filled: ${filled} contracts on market ${event.market}`);
+        } else if (filled === 0n) {
+          console.warn(`Market order not filled — no counterparty on market ${event.market}`);
+        } else {
+          console.warn(`Partial fill: ${filled}/${requested} contracts on market ${event.market}`);
+        }
+      }
+      break;
+    }
+
+    case "PositionUpdated": {
+      if (event.owner === myAddressHex) {
+        console.log(
+          `Position: market=${event.market} side=${event.side} ` +
+          `size=${event.size} entry=${event.entryPrice}`
+        );
+      }
+      break;
+    }
+
+    case "PositionClosed": {
+      if (event.owner === myAddressHex) {
+        const pnl = BigInt(event.realizedPnl);
+        const pnlUsd = (Number(pnl) / 1_000_000).toFixed(2);
+        const sign = pnl >= 0n ? "+" : "";
+        console.log(`Position closed: market=${event.market} PnL=${sign}$${pnlUsd}`);
+      }
+      break;
+    }
+
+    case "FundingSettled": {
+      if (event.owner === myAddressHex) {
+        const payment = BigInt(event.payment);
+        const paymentUsd = (Number(payment) / 1_000_000).toFixed(4);
+        const sign = payment >= 0n ? "+" : "";
+        console.log(`Funding: market=${event.market} payment=${sign}$${paymentUsd}`);
+      }
+      break;
+    }
+
+    case "AccountLiquidated": {
+      if (event.owner === myAddressHex) {
+        console.error(
+          `LIQUIDATED: market=${event.market} side=${event.side} size=${event.size} ` +
+          `markPrice=${event.markPrice} pnl=${event.realizedPnl}`
+        );
+      }
+      break;
+    }
+
+    case "FundingApplied": {
+      // Market-wide funding tick — log for all markets
+      console.log(
+        `Funding applied: market=${event.market} rate=${event.fundingRateBps}bps ` +
+        `cumulative=${event.cumulativeFunding}`
+      );
+      break;
+    }
+
+    case "OrderbookLevelUpdated": {
+      // High-frequency — only log significant changes
+      if (Number(event.orderCount) === 0) {
+        console.log(`Level cleared: market=${event.market} side=${event.side} price=${event.price}`);
+      }
+      break;
+    }
+
+    // Other event types: PriceUpdated, FeesCollected, Deposited, Withdrawn,
+    // AgentApproved, AgentRevoked, MarketCreated — handle as needed
+    default:
+      break;
+  }
+});
+
+// Run for 60 seconds then clean up
+setTimeout(() => {
+  unsub();
+  client.disconnect();
+  console.log("Disconnected");
+}, 60_000);
+```
+
+---
+
+## Cleanup
+
+Always call `client.disconnect()` when you are done to cleanly close the WebSocket and cancel any pending reconnection timers.
+
+```typescript
+// Remove one listener but keep the socket open
+const unsub = client.subscribeBlocks(handler);
+unsub();
+
+// Close the socket and cancel reconnects entirely
+client.disconnect();
+```
+
+<Tip>
+  In long-running server processes, register a `SIGTERM` / `SIGINT` handler that calls `client.disconnect()` to avoid dangling WebSocket connections and event listeners.
+</Tip>

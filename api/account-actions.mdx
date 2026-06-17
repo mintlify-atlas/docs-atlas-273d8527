@@ -1,0 +1,355 @@
+---
+title: "Account Action Types: Leverage, Agents, and Funds"
+sidebarTitle: "Account Actions"
+description: "Field reference for account management actions: leverage overrides, agent delegation, withdrawal flows, and relayer-only deposit and confirm operations."
+---
+
+Account actions govern everything outside the order book: how much leverage an account uses, which delegate wallets may trade on its behalf, and how USDC moves between the exchange and Solana. Some of these actions are fully user-controlled; others — particularly those that touch on-chain bridge events — are restricted to authorized relayer signers. Type signatures are drawn directly from `src/types.ts`. Each section below indicates whether the action is user-signed or relayer-only.
+
+---
+
+## SetUserMarketLeverage
+
+<Callout type="info">**User-signed.** `owner` must equal the envelope signer's derived address.</Callout>
+
+Pick a per-market initial-margin override for the account. The engine takes `max(market.imBps, userImBps)` on every IM check, so users can only deleverage relative to the market floor — they cannot exceed the market's own IM requirement. Setting `userImBps` to `0` clears any existing override and reverts to the market default.
+
+```typescript
+export interface SetUserMarketLeverage {
+  owner: Address;
+  market: number;
+  userImBps: number;
+}
+```
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address picking the override. Must equal the envelope signer's derived address.
+</ParamField>
+
+<ParamField body="market" type="number" required>
+  Market identifier the override applies to.
+</ParamField>
+
+<ParamField body="userImBps" type="number" required>
+  Initial margin override in basis points. `0` clears the override and reverts to the market default. Any non-zero value must be `>= market.imBps`; the engine rejects lower values with `UserLeverageBelowMarketIm` (error code 38).
+</ParamField>
+
+```typescript
+// Set a 20% initial margin requirement on market 1 (5x max leverage)
+await client.submitTx({
+  type: "SetUserMarketLeverage",
+  data: {
+    owner: address,
+    market: 1,
+    userImBps: 2000, // 20%
+  },
+});
+
+// Clear the override — revert to market default
+await client.submitTx({
+  type: "SetUserMarketLeverage",
+  data: {
+    owner: address,
+    market: 1,
+    userImBps: 0,
+  },
+});
+```
+
+---
+
+## ApproveAgent
+
+<Callout type="info">**User-signed.** Signed by the delegating account owner.</Callout>
+
+Approve a delegate Ed25519 keypair (an "agent wallet") to place and cancel orders on the owner's behalf. The approved agent can submit all order-management actions but **cannot** withdraw funds or move collateral. Delegation is identified by the full 32-byte Ed25519 public key.
+
+```typescript
+export interface ApproveAgent {
+  owner: Address;
+  agentPubkey: Uint8Array; // 32 bytes
+}
+```
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address granting the delegation.
+</ParamField>
+
+<ParamField body="agentPubkey" type="Uint8Array" required>
+  Ed25519 public key of the agent wallet (32 bytes). The engine derives a 20-byte address from this key and records it as the authorized agent.
+</ParamField>
+
+```typescript
+import { generateKeypair, pubkeyToOwner } from "@proof/trading-sdk";
+
+const agent = generateKeypair();
+
+await client.submitTx({
+  type: "ApproveAgent",
+  data: {
+    owner: address,
+    agentPubkey: agent.publicKey, // 32-byte Uint8Array
+  },
+});
+```
+
+---
+
+## RevokeAgent
+
+<Callout type="info">**User-signed.** Signed by the delegating account owner.</Callout>
+
+Revoke a previously approved agent wallet. After revocation the agent's signatures are rejected by the engine immediately. Identify the agent by its 32-byte Ed25519 public key.
+
+```typescript
+export interface RevokeAgent {
+  owner: Address;
+  agentPubkey: Uint8Array; // 32 bytes
+}
+```
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address revoking the delegation.
+</ParamField>
+
+<ParamField body="agentPubkey" type="Uint8Array" required>
+  Ed25519 public key of the agent wallet to revoke (32 bytes). Must match the key passed to the corresponding `ApproveAgent` action.
+</ParamField>
+
+```typescript
+await client.submitTx({
+  type: "RevokeAgent",
+  data: {
+    owner: address,
+    agentPubkey: agent.publicKey,
+  },
+});
+```
+
+---
+
+## WithdrawRequest
+
+<Callout type="info">**User-signed.** Initiates the two-step withdrawal flow.</Callout>
+
+Request a USDC withdrawal to a Solana address. The requested amount is debited from the account balance immediately and placed into a `Pending` withdrawal record. The relayer then picks up the record, executes the Solana transfer, and calls either `ConfirmWithdrawal` or `FailWithdrawal`.
+
+```typescript
+export interface WithdrawRequest {
+  owner: Address;
+  amount: bigint;
+  solanaDestination: Uint8Array; // 32 bytes
+}
+```
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address requesting the withdrawal.
+</ParamField>
+
+<ParamField body="amount" type="bigint" required>
+  Withdrawal amount in microUSDC (6 decimal places). For example, `100_000_000n` = $100.00 USDC.
+</ParamField>
+
+<ParamField body="solanaDestination" type="Uint8Array" required>
+  Solana destination public key (Ed25519, 32 bytes). This is the raw public key bytes — not a base58 address string.
+</ParamField>
+
+```typescript
+await client.submitTx({
+  type: "WithdrawRequest",
+  data: {
+    owner: address,
+    amount: 500_000_000n,          // $500.00 USDC
+    solanaDestination: solanaPublicKeyBytes, // 32-byte Uint8Array
+  },
+});
+```
+
+---
+
+## WithdrawalRecord and WithdrawalStatus
+
+These types are returned by `queryWithdrawal` and mirror the engine's `WithdrawalRecord` struct field-for-field.
+
+```typescript
+export type WithdrawalStatus = "Pending" | "Completed" | "Failed";
+
+export interface WithdrawalRecord {
+  id: bigint;
+  owner: Address;
+  amount: bigint;
+  solanaDestination: Uint8Array;
+  status: WithdrawalStatus;
+  requestHeight: bigint;
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `bigint` | Engine-assigned withdrawal ID used in `ConfirmWithdrawal` and `FailWithdrawal` |
+| `owner` | `Address` | 20-byte address that requested the withdrawal |
+| `amount` | `bigint` | Requested amount in microUSDC |
+| `solanaDestination` | `Uint8Array` | 32-byte Solana destination public key |
+| `status` | `WithdrawalStatus` | `"Pending"` → `"Completed"` or `"Pending"` → `"Failed"`; never reverses |
+| `requestHeight` | `bigint` | Block height at which the `WithdrawRequest` was admitted |
+
+---
+
+## ConfirmDeposit
+
+<Callout type="warning">**Relayer-only.** The envelope signer's derived address must equal `signer` and be on the relayer allowlist.</Callout>
+
+Confirm an on-chain USDC deposit that was observed on Solana. The `solanaTxSig` field acts as an idempotency key — re-submitting the same signature is a no-op. This is the preferred production deposit path; use `Deposit` only for dev/bootstrap scenarios.
+
+```typescript
+export interface ConfirmDeposit {
+  owner: Address;
+  amount: bigint;
+  solanaTxSig: Uint8Array;
+  signer: Address;
+}
+```
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address to credit.
+</ParamField>
+
+<ParamField body="amount" type="bigint" required>
+  Deposit amount in microUSDC (6 decimal places).
+</ParamField>
+
+<ParamField body="solanaTxSig" type="Uint8Array" required>
+  Solana transaction signature (typically 64 bytes) used for idempotency. Duplicate signatures are ignored.
+</ParamField>
+
+<ParamField body="signer" type="Address" required>
+  Authorized relayer signer address (20 bytes). Must match the envelope signer's derived address and be on the relayer allowlist.
+</ParamField>
+
+---
+
+## ConfirmWithdrawal
+
+<Callout type="warning">**Relayer-only.** The envelope signer must match `signer` and be on the relayer allowlist.</Callout>
+
+Mark a `Pending` withdrawal as `Completed` after the USDC transfer was sent on Solana. This transitions `WithdrawalRecord.status` to `"Completed"` and records the Solana transaction signature.
+
+```typescript
+export interface ConfirmWithdrawal {
+  withdrawalId: bigint;
+  solanaTxSig: Uint8Array;
+  signer: Address;
+}
+```
+
+<ParamField body="withdrawalId" type="bigint" required>
+  Engine-assigned withdrawal ID (from `WithdrawalRecord.id`).
+</ParamField>
+
+<ParamField body="solanaTxSig" type="Uint8Array" required>
+  Solana transaction signature for the completed transfer (typically 64 bytes).
+</ParamField>
+
+<ParamField body="signer" type="Address" required>
+  Authorized relayer signer address (20 bytes).
+</ParamField>
+
+---
+
+## FailWithdrawal
+
+<Callout type="warning">**Relayer-only.** The envelope signer must match `signer` and be on the relayer allowlist.</Callout>
+
+Mark a `Pending` withdrawal as permanently `Failed` and refund the debited balance back to the account. This transitions `WithdrawalRecord.status` to `"Failed"`.
+
+```typescript
+export interface FailWithdrawal {
+  withdrawalId: bigint;
+  reason: string;
+  signer: Address;
+}
+```
+
+<ParamField body="withdrawalId" type="bigint" required>
+  Engine-assigned withdrawal ID (from `WithdrawalRecord.id`).
+</ParamField>
+
+<ParamField body="reason" type="string" required>
+  Human-readable reason for the failure. Stored in the withdrawal record and surfaced to clients.
+</ParamField>
+
+<ParamField body="signer" type="Address" required>
+  Authorized relayer signer address (20 bytes).
+</ParamField>
+
+---
+
+## Deposit
+
+<Callout type="warning">**Relayer-only.** Legacy credit action — prefer `ConfirmDeposit` for production flows tied to Solana bridge events.</Callout>
+
+Directly credit USDC to an account without a corresponding Solana transaction. Per audit B1 (2026-04-23) the envelope signer's derived address must equal `signer`, and `signer` must be on the on-chain relayer allowlist. Clients outside the allowlist receive `UnauthorizedRelayer`.
+
+```typescript
+export interface Deposit {
+  owner: Address;
+  amount: bigint;
+  signer: Address;
+}
+```
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address to credit.
+</ParamField>
+
+<ParamField body="amount" type="bigint" required>
+  Deposit amount in microUSDC (6 decimal places). For example, `100_000_000n` = $100.00 USDC.
+</ParamField>
+
+<ParamField body="signer" type="Address" required>
+  Authorized relayer signer address (20 bytes). Must match the envelope signer's derived address and be on the relayer allowlist.
+</ParamField>
+
+---
+
+## Withdraw
+
+<Callout type="warning">**Relayer-only.** Prefer `WithdrawRequest` + `ConfirmWithdrawal` for the standard two-step user withdrawal flow.</Callout>
+
+Directly debit USDC from an account, checking margin requirements. Per audit B2 (2026-04-23) the same relayer-authorization contract applies as `Deposit`.
+
+```typescript
+export interface Withdraw {
+  owner: Address;
+  amount: bigint;
+  signer: Address;
+}
+```
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address to debit.
+</ParamField>
+
+<ParamField body="amount" type="bigint" required>
+  Withdrawal amount in microUSDC (6 decimal places).
+</ParamField>
+
+<ParamField body="signer" type="Address" required>
+  Authorized relayer signer address (20 bytes). Must match the envelope signer's derived address and be on the relayer allowlist.
+</ParamField>
+
+---
+
+## Authorization Summary
+
+| Action | Signer Requirement |
+|---|---|
+| `SetUserMarketLeverage` | Owner (user-signed; `owner` == envelope signer) |
+| `ApproveAgent` | Owner |
+| `RevokeAgent` | Owner |
+| `WithdrawRequest` | Owner |
+| `ConfirmDeposit` | Relayer allowlist |
+| `ConfirmWithdrawal` | Relayer allowlist |
+| `FailWithdrawal` | Relayer allowlist |
+| `Deposit` | Relayer allowlist |
+| `Withdraw` | Relayer allowlist |

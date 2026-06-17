@@ -1,0 +1,452 @@
+---
+title: "Placing and Managing Orders on the Proof Exchange"
+sidebarTitle: "Placing Orders"
+description: "Submit limit orders, market orders, and advanced order types — cancel, replace, amend, close, and basket — using the Proof Trading SDK."
+---
+
+Every trade on the Proof Exchange is an **action** — a signed, MessagePack-encoded payload submitted via `client.submitTx()` or `client.submitTxCommit()`. The SDK handles nonce allocation, Ed25519 signing, and routing through the public API gateway automatically. This guide walks through every order action available, from a simple limit order to a multi-leg atomic basket.
+
+## Unit Conventions
+
+Before placing any order, understand the wire units the engine expects:
+
+| Field | Unit | Example |
+|---|---|---|
+| `price` | Integer cents (2 dp) | `5000000n` = $50,000.00 |
+| `quantity` | Integer contracts (lots) | `1n` = 1 lot |
+| `balance` / fees | MicroUSDC (6 dp) | `10_000_000_000n` = $10,000 |
+| `clientOrderId` | `bigint` | Any integer you choose |
+
+All prices and quantities are `bigint` — never floats.
+
+---
+
+## Limit Orders
+
+A limit order rests on the book until filled, cancelled, or expired. Use `PlaceOrder` with a `price` and `quantity`.
+
+```typescript
+import {
+  ExchangeClient,
+  Side,
+  TimeInForce,
+  generateKeypair,
+  pubkeyToOwner,
+} from "@proof/trading-sdk";
+
+const { publicKey, privateKey } = generateKeypair();
+const address = pubkeyToOwner(publicKey);
+
+const client = new ExchangeClient({ chainId: "exchange-devnet-1" });
+client.setPrivateKey(privateKey);
+
+// Place a GTC buy limit order at $50,000.00 for 1 contract on market 1
+const result = await client.submitTx({
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: address,
+    side: Side.Buy,
+    price: 5000000n,    // $50,000.00 in cents
+    quantity: 1n,
+  },
+});
+
+console.log(result.code, result.hash); // 0, "ABCD..."
+```
+
+### Order Fields
+
+| Field | Type | Notes |
+|---|---|---|
+| `market` | `number` | Market ID (e.g. 1 = BTC, 2 = ETH) |
+| `owner` | `Uint8Array` (20 bytes) | `pubkeyToOwner(publicKey)` |
+| `side` | `Side.Buy` / `Side.Sell` | Buy = long, Sell = short |
+| `price` | `bigint` | Integer cents. $50,000 → `5000000n` |
+| `quantity` | `bigint` | Integer contracts (lots) |
+| `clientOrderId` | `bigint?` | Optional client-scoped dedup / tracking ID |
+| `postOnly` | `boolean?` | `true` → rejected if it would cross the book (code 34) |
+| `reduceOnly` | `boolean?` | `true` → only reduces an existing position; over-closing is clamped |
+| `timeInForce` | `TimeInForce?` | `Gtc` (default), `Ioc`, or `Fok` |
+
+### Time-in-Force Options
+
+<Tabs>
+  <Tab title="GTC (default)">
+    ```typescript
+    // Good-Till-Cancelled: unmatched quantity rests on the book
+    await client.submitTx({
+      type: "PlaceOrder",
+      data: {
+        market: 1,
+        owner: address,
+        side: Side.Sell,
+        price: 5100000n, // $51,000.00
+        quantity: 2n,
+        timeInForce: TimeInForce.Gtc, // or omit — GTC is the default
+      },
+    });
+    ```
+  </Tab>
+  <Tab title="IOC">
+    ```typescript
+    // Immediate-Or-Cancel: fills what it can, drops the rest
+    await client.submitTx({
+      type: "PlaceOrder",
+      data: {
+        market: 1,
+        owner: address,
+        side: Side.Buy,
+        price: 5000000n,
+        quantity: 5n,
+        timeInForce: TimeInForce.Ioc,
+      },
+    });
+    ```
+  </Tab>
+  <Tab title="FOK">
+    ```typescript
+    // Fill-Or-Kill: fully fill immediately or reject entirely
+    await client.submitTx({
+      type: "PlaceOrder",
+      data: {
+        market: 1,
+        owner: address,
+        side: Side.Buy,
+        price: 5000000n,
+        quantity: 3n,
+        timeInForce: TimeInForce.Fok,
+      },
+    });
+    ```
+  </Tab>
+</Tabs>
+
+### Post-Only and Reduce-Only
+
+```typescript
+// Post-only: guaranteed maker fill — rejected with code 34 if it would cross
+await client.submitTx({
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: address,
+    side: Side.Buy,
+    price: 4990000n,
+    quantity: 1n,
+    postOnly: true,
+  },
+});
+
+// Reduce-only: can only shrink an existing position
+await client.submitTx({
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: address,
+    side: Side.Sell,
+    price: 5100000n,
+    quantity: 1n,
+    reduceOnly: true,
+  },
+});
+```
+
+---
+
+## Market Orders
+
+A market order crosses immediately against resting liquidity and does not accept a price. Any unfilled quantity is silently dropped (IOC semantics). Listen for a `MarketOrderProcessed` event to determine how much was actually filled.
+
+```typescript
+// Buy 2 contracts at market price on market 1
+const result = await client.submitTx({
+  type: "MarketOrder",
+  data: {
+    market: 1,
+    owner: address,
+    side: Side.Buy,
+    quantity: 2n,
+    clientOrderId: 42n, // optional — echoed in MarketOrderProcessed event
+  },
+});
+```
+
+<Note>
+  A `MarketOrderProcessed` event is emitted at the end of every market-order transaction. It is the authoritative fill signal: `filledQuantity === requestedQuantity` means a full fill, `filledQuantity === 0n` means no counterparty was found.
+</Note>
+
+---
+
+## Cancelling Orders
+
+### Cancel by Engine Order ID
+
+Use `CancelOrder` when you have the engine-assigned `orderId` from an `OrderPlaced` event.
+
+```typescript
+await client.submitTx({
+  type: "CancelOrder",
+  data: {
+    orderId: 1001n, // engine-assigned ID from OrderPlaced event
+    owner: address,
+  },
+});
+```
+
+### Cancel by Client Order ID
+
+Use `CancelClientOrder` when you track orders by your own `clientOrderId`.
+
+```typescript
+await client.submitTx({
+  type: "CancelClientOrder",
+  data: {
+    owner: address,
+    clientOrderId: 42n,
+  },
+});
+```
+
+### Cancel All Orders
+
+`CancelAllOrders` cancels every resting order for an account. Optionally scope it to a single market.
+
+```typescript
+// Cancel all orders across all markets
+await client.submitTx({
+  type: "CancelAllOrders",
+  data: { owner: address },
+});
+
+// Cancel only on market 1
+await client.submitTx({
+  type: "CancelAllOrders",
+  data: { owner: address, market: 1 },
+});
+```
+
+---
+
+## Cancel-Replace (Atomic Modify)
+
+`CancelReplaceOrder` atomically cancels a resting order and places its replacement in a single transaction. Both legs succeed or neither does — there is no partial execution.
+
+<Tabs>
+  <Tab title="Cancel by Engine ID">
+    ```typescript
+    await client.submitTx({
+      type: "CancelReplaceOrder",
+      data: {
+        owner: address,
+        cancelOrderId: 1001n,        // engine-assigned ID to cancel
+        market: 1,
+        side: Side.Buy,
+        price: 4985000n,             // new price
+        quantity: 2n,                // new quantity
+        clientOrderId: 99n,          // optional — for the replacement
+        postOnly: false,
+        timeInForce: TimeInForce.Gtc,
+      },
+    });
+    ```
+  </Tab>
+  <Tab title="Cancel by Client ID">
+    ```typescript
+    await client.submitTx({
+      type: "CancelReplaceOrder",
+      data: {
+        owner: address,
+        cancelClientOrderId: 42n,    // your own ID to cancel
+        market: 1,
+        side: Side.Buy,
+        price: 4985000n,
+        quantity: 2n,
+        clientOrderId: 43n,          // new client ID for the replacement
+        timeInForce: TimeInForce.Gtc,
+      },
+    });
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+  `cancelOrderId` and `cancelClientOrderId` are mutually exclusive — provide exactly one.
+</Warning>
+
+---
+
+## Amend Order
+
+`AmendOrder` changes the price or quantity of a resting order **in place**, preserving the engine order ID and its queue priority for the fields that don't change.
+
+```typescript
+// Change only the price
+await client.submitTx({
+  type: "AmendOrder",
+  data: {
+    owner: address,
+    orderId: 1001n,
+    newPrice: 4990000n,   // new limit price in cents
+    // newQuantity omitted → keeps current quantity
+  },
+});
+
+// Change only the quantity
+await client.submitTx({
+  type: "AmendOrder",
+  data: {
+    owner: address,
+    orderId: 1001n,
+    // newPrice omitted → keeps current price
+    newQuantity: 3n,
+  },
+});
+```
+
+<Note>
+  Unlike `CancelReplaceOrder`, `AmendOrder` does not change the engine-assigned order ID. However, amending a quantity upward may lose queue priority depending on engine version.
+</Note>
+
+---
+
+## Close Position
+
+`ClosePosition` submits an opposite-side IOC order at `oracle ± spread` to close an entire position in one action. It is **idempotent** — if no position exists the engine returns code 0 without emitting any events.
+
+```typescript
+// Close the entire long position on market 1
+await client.submitTx({
+  type: "ClosePosition",
+  data: {
+    market: 1,
+    owner: address,
+  },
+});
+```
+
+<Tip>
+  `ClosePosition` is the recommended way to fully exit a position. It avoids the need to query position size and construct an explicit IOC order manually.
+</Tip>
+
+---
+
+## Atomic Basket Order
+
+`AtomicBasketOrder` is a native multi-leg fill-or-kill order. Every leg must fill completely at its specified price or better, or the entire transaction reverts.
+
+```typescript
+import type { AtomicBasketLeg } from "@proof/trading-sdk";
+
+const legs: AtomicBasketLeg[] = [
+  {
+    market: 1,
+    side: Side.Buy,
+    price: 5000000n,   // worst acceptable buy price (will not pay above)
+    quantity: 1n,
+    clientOrderId: 101n,
+  },
+  {
+    market: 2,
+    side: Side.Sell,
+    price: 3000000n,   // worst acceptable sell price (will not sell below)
+    quantity: 2n,
+    clientOrderId: 102n,
+    reduceOnly: true,
+  },
+];
+
+await client.submitTx({
+  type: "AtomicBasketOrder",
+  data: {
+    owner: address,
+    legs,
+    maxSlippageBps: 50, // informational — emitted in events for auditability
+  },
+});
+```
+
+<Warning>
+  If any leg cannot fill at the specified price or better, the entire basket transaction reverts. There is no partial basket execution.
+</Warning>
+
+---
+
+## Submission Modes
+
+The SDK provides two submission paths depending on how much confirmation you need.
+
+<CodeGroup>
+```typescript submitTx (fire-and-forget)
+// Returns after CheckTx passes. A background verifier polls DeliverTx.
+const r = await client.submitTx({
+  type: "PlaceOrder",
+  data: { market: 1, owner: address, side: Side.Buy, price: 5000000n, quantity: 1n },
+});
+// r.code === 0 → CheckTx passed; tx is in the mempool
+console.log(r.code, r.hash);
+
+// Collect DeliverTx results later
+const deliveries = await client.awaitPendingVerifies();
+for (const d of deliveries) {
+  if (d.code !== 0) console.error("Tx failed at inclusion:", d.log);
+}
+```
+
+```typescript submitTxCommit (synchronous)
+// Polls /tx?hash up to 9s — returns the actual DeliverTx result
+const r = await client.submitTxCommit({
+  type: "PlaceOrder",
+  data: { market: 1, owner: address, side: Side.Buy, price: 5000000n, quantity: 1n },
+});
+// r.code === 0 → confirmed on-chain
+// r.height   → block number it landed in
+console.log(r.code, r.height, r.hash);
+```
+</CodeGroup>
+
+### TxResult Shape
+
+```typescript
+interface TxResult {
+  code: number;      // 0 = success; non-zero = error code
+  hash: string;      // hex transaction hash (uppercase)
+  height?: number;   // block height (populated by submitTxCommit and DeliverTx verifier)
+  log?: string;      // human-readable error message on failure
+  events?: TxEvent[]; // ABCI events emitted by the transaction
+}
+```
+
+### Common Error Codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `12` | Insufficient margin |
+| `17` | Invalid signature |
+| `21` | Invalid / duplicate nonce — retry immediately |
+| `34` | Post-only order would cross the book |
+| `35` | Reduce-only order would increase position |
+| `38` | User leverage below market IM floor |
+| `401` | Missing or invalid API key |
+| `429` | Rate limited by gateway |
+
+### Error Handling Pattern
+
+```typescript
+const r = await client.submitTx({
+  type: "PlaceOrder",
+  data: { market: 1, owner: address, side: Side.Buy, price: 5000000n, quantity: 1n },
+});
+
+if (r.code !== 0) {
+  if (r.code === 21) {
+    // Timestamp nonce collision — the SDK auto-advances; just retry
+    return await client.submitTx({ type: "PlaceOrder", data: { /* ... */ } });
+  }
+  if (r.code === 12) {
+    console.warn("Insufficient margin — check account balance");
+  }
+  throw new Error(`Order failed: code=${r.code} log=${r.log}`);
+}
+```

@@ -1,0 +1,179 @@
+---
+title: "Install the Proof Trading SDK in Your Project"
+sidebarTitle: "Installation"
+description: "Set up the Proof Trading SDK for TypeScript, Python, or Rust. Covers runtime requirements, devnet config, and a connectivity health check."
+---
+
+The Proof Trading SDK is available for TypeScript/Node.js, Python, and Rust. All three language bindings share the same wire protocol and devnet defaults, so you can freely mix them in a multi-service architecture. This page covers everything you need to get a working installation verified against the public devnet.
+
+## TypeScript / Node.js
+
+### Install the package
+
+<CodeGroup>
+
+```bash npm
+npm install @proof/trading-sdk
+```
+
+```bash yarn
+yarn add @proof/trading-sdk
+```
+
+```bash pnpm
+pnpm add @proof/trading-sdk
+```
+
+</CodeGroup>
+
+The package name on npm is `@proof/trading-sdk`. It ships as a pre-built ESM bundle (`dist/index.js`) with bundled TypeScript declarations (`dist/index.d.ts`).
+
+### Runtime requirements
+
+| Requirement   | Minimum version | Notes                                                       |
+| ------------- | --------------- | ----------------------------------------------------------- |
+| Node.js       | **18**          | Required for native `fetch`, `crypto.getRandomValues`, and `WebSocket`. |
+| TypeScript    | **6.0**         | `tsconfig` `devDependency` in the SDK's own `package.json`. |
+| Module system | **ESM**         | Set `"type": "module"` in your `package.json`.              |
+
+Because the package uses `"type": "module"`, your project must also be an ESM module. Add the following to your `package.json` if it is not already present:
+
+```json
+{
+  "type": "module"
+}
+```
+
+<Note>
+  CommonJS (`require()`) is not supported. If you are working in a CJS codebase, use a dynamic `import()` at the call site, or migrate to ESM top-level imports.
+</Note>
+
+### Verify your installation
+
+Import `ExchangeClient`, connect to the devnet, and call `queryHealth()`. This makes a single HTTP request to `https://api.dev.proof.trade/health` and confirms that your environment can reach the gateway:
+
+```typescript
+import { ExchangeClient } from "@proof/trading-sdk";
+
+const client = new ExchangeClient({ chainId: "exchange-devnet-1" });
+
+const health = await client.queryHealth();
+console.log(health);
+// { status: "ok", height: 123456 }
+
+client.disconnect();
+```
+
+Run this with `tsx` (no build step required):
+
+```bash
+npx tsx health-check.ts
+```
+
+A response of `{ status: "ok", height: <number> }` confirms end-to-end connectivity.
+
+---
+
+## Python
+
+Install the Python package from PyPI:
+
+```bash
+pip install proof-trading-sdk
+```
+
+The Python package is backed by a compiled Rust core via [PyO3](https://pyo3.rs/). A pre-compiled wheel is published for common platforms, so no Rust toolchain is required to install it. The build configuration lives in `python/pyproject.toml` in the SDK repository.
+
+<Note>
+  If a pre-compiled wheel is not available for your platform, `pip` will attempt to build from source. In that case you need a Rust toolchain (`rustup toolchain install stable`) and the `maturin` build backend installed.
+</Note>
+
+---
+
+## Rust
+
+Add the crate to your `Cargo.toml`:
+
+```toml
+[dependencies]
+proof-trading-sdk = "*"
+```
+
+The native Rust crate lives at `crates/proof-trading-sdk` in the SDK monorepo and is published to [crates.io](https://crates.io). It is the canonical implementation that both the TypeScript and Python bindings are built on top of.
+
+---
+
+## Devnet configuration
+
+The SDK ships with the following devnet defaults. No configuration is required to connect to the public devnet:
+
+| Parameter   | Default value                    | Environment variable  |
+| ----------- | -------------------------------- | --------------------- |
+| Gateway URL | `https://api.dev.proof.trade`    | `PROOF_GATEWAY_URL`   |
+| Chain ID    | `exchange-devnet-1`              | `PROOF_CHAIN_ID`      |
+| Faucet URL  | `https://faucet.dev.proof.trade` | `PROOF_FAUCET_URL`    |
+
+A minimal devnet client needs only a `chainId`:
+
+```typescript
+import { ExchangeClient } from "@proof/trading-sdk";
+
+const client = new ExchangeClient({ chainId: "exchange-devnet-1" });
+```
+
+---
+
+## Local stack configuration
+
+When running a local development stack (CometBFT node + exchange API + gateway), point each URL at your local services:
+
+```typescript
+import { ExchangeClient } from "@proof/trading-sdk";
+
+const client = new ExchangeClient({
+  rpcUrl:     "http://localhost:26657",  // CometBFT RPC
+  apiUrl:     "http://localhost:8080",   // Exchange query API
+  gatewayUrl: "http://localhost:9080",   // Gateway (tx submission)
+  chainId:    "proof-dev",
+});
+```
+
+All four fields map directly to `ExchangeClientOptions`:
+
+```typescript
+interface ExchangeClientOptions {
+  rpcUrl?:     string;  // default: https://api.dev.proof.trade
+  apiUrl?:     string;  // default: https://api.dev.proof.trade
+  gatewayUrl?: string;  // default: https://api.dev.proof.trade
+  chainId?:    string;  // default: "exchange-devnet-1"
+  useGateway?: boolean; // default: true
+  apiKey?:     string;  // gateway API key (optional)
+}
+```
+
+<Note>
+  Always pin `chainId` explicitly in production and CI environments. When `chainId` is omitted, the SDK auto-resolves it from the CometBFT `/status` endpoint at startup. Pinning it ensures signatures are deterministic across builds and prevents subtle cross-chain replay issues if the auto-resolved value changes.
+</Note>
+
+---
+
+## ExchangeClientOptions reference
+
+| Option       | Type      | Default                         | Description                                            |
+| ------------ | --------- | ------------------------------- | ------------------------------------------------------ |
+| `rpcUrl`     | `string`  | `https://api.dev.proof.trade`   | CometBFT RPC endpoint for block queries.               |
+| `apiUrl`     | `string`  | `https://api.dev.proof.trade`   | Exchange query API for orderbooks, accounts, tickers.  |
+| `gatewayUrl` | `string`  | `https://api.dev.proof.trade`   | Gateway endpoint for `POST /exchange` tx submission.   |
+| `chainId`    | `string`  | `"exchange-devnet-1"`           | Chain ID embedded in every transaction signature.      |
+| `useGateway` | `boolean` | `true`                          | Route transactions through gateway rather than direct CometBFT broadcast. |
+| `apiKey`     | `string`  | —                               | Bearer token for gateway endpoints that require auth.  |
+
+<Tip>
+  Run the SDK's included end-to-end example to confirm that all layers (key generation, query, and trading) work correctly in your environment:
+
+  ```bash
+  npx tsx examples/connect-and-trade.ts
+  ```
+
+  Set `PROOF_FAUCET_TOKEN` to run the full generate → fund → place order → cancel cycle.
+</Tip>

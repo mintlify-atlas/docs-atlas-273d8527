@@ -1,0 +1,155 @@
+---
+title: "Numeric Units and Precision in the Proof SDK"
+sidebarTitle: "Units"
+description: "All prices and quantities use integer u64 (BigInt) types. Learn the exact scale for prices, balances, fees, and addresses used across the SDK."
+---
+
+The Proof Exchange engine and SDK use **integer-only arithmetic** throughout. There are no floating-point price or balance fields anywhere in the wire format. Every numeric type has a well-defined integer scale, and the engine validates that scale on every submitted transaction. Understanding these conventions is essential before writing any trading logic.
+
+## Quick reference
+
+| Field | Unit | TypeScript type | Example value | Decoded display |
+|---|---|---|---|---|
+| Prices | Integer cents (2 dp) | `bigint` | `6675234n` | $66,752.34 |
+| Balances / amounts | MicroUSDC (6 dp) | `bigint` | `100_000_000_000n` | $100,000.00 |
+| Fees / margin rates | Basis points | `number` | `500` | 5% |
+| Quantities | Integer contracts (lots) | `bigint` | `1n` | 1 contract |
+| Addresses | 20-byte binary | `Uint8Array` | `pubkeyToOwner(pubkey)` | 20 raw bytes |
+
+## Prices — integer cents
+
+Prices are expressed as **integer cents with two decimal places**. Multiply the dollar price by 100 to get the wire value:
+
+```typescript
+// $66,752.34 → 6675234n
+const btcPrice = 6675234n;
+
+// $50,000.00 → 5000000n
+const roundPrice = 5000000n;
+
+// $0.01 (minimum representable price tick) → 1n
+const minTick = 1n;
+
+// Place a limit order at $66,752.34
+await client.submitTx({
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: address,
+    side: Side.Buy,
+    price: 6675234n, // $66,752.34
+    quantity: 1n,
+  },
+});
+```
+
+Oracle prices and order book levels returned by `queryOrderbook()` use the same scale. When displaying a price, divide by `100` (or format with two decimal places):
+
+```typescript
+const rawPrice = 6675234n;
+const displayPrice = Number(rawPrice) / 100; // 66752.34
+```
+
+## Balances and amounts — microUSDC
+
+Account balances, deposit amounts, withdrawal amounts, and fees are expressed in **microUSDC** — millionths of a USDC dollar (6 decimal places). Multiply the dollar amount by 1,000,000:
+
+```typescript
+// $100.00 → 100_000_000n µUSDC
+const smallDeposit = 100_000_000n;
+
+// $100,000.00 → 100_000_000_000n µUSDC
+const largeDeposit = 100_000_000_000n;
+
+// $10,000 (devnet faucet amount) → 10_000_000_000n µUSDC
+const faucetAmount = 10_000_000_000n;
+
+// Read your own balance (returned as bigint)
+const account = await client.queryAccount();
+if (account) {
+  const balanceUsd = Number(account.balance) / 1_000_000;
+  console.log(`Balance: $${balanceUsd.toFixed(2)}`); // e.g. "Balance: $10000.00"
+}
+```
+
+Fee events emitted after a fill (e.g. `TradeExecutedEvent.takerFee`) are also in microUSDC. These come back as strings in event payloads and should be parsed with `BigInt()`.
+
+## Fees and margin rates — basis points
+
+Fee rates, initial margin (IM) requirements, and maintenance margin (MM) requirements are all expressed in **basis points** (bps), where 1 bp = 0.01%:
+
+```typescript
+// 0.05% taker fee → 5 bps
+const takerFeeBps = 5;
+
+// 10% initial margin (10x max leverage) → 1000 bps
+const imBps = 1000;
+
+// 5% maintenance margin → 500 bps
+const mmBps = 500;
+
+// 5% funding rate cap → 500 bps
+const maxFundingRateBps = 500;
+
+// Read market config
+const markets = await client.queryMarkets();
+const btc = markets[0];
+const maxLeverage = 10_000 / btc.imBps; // e.g. 10000 / 1000 = 10x
+```
+
+To convert bps to a percentage: `bps / 100`. To convert to a multiplier: `bps / 10_000`.
+
+## Quantities — integer contracts (lots)
+
+Order quantities and position sizes are expressed in **integer contracts** (also called "lots"). There is no fractional-contract support at the wire level. Some markets have a `szDecimals` metadata field (display-only) indicating that one contract represents `10^-szDecimals` of the base asset, but the engine always operates in integer lots:
+
+```typescript
+// Buy 1 contract
+const qty = 1n;
+
+// Buy 10 contracts
+const bigQty = 10n;
+
+// Position size returned as bigint
+const account = await client.queryAccount();
+for (const pos of account?.positions ?? []) {
+  console.log(`Position: ${pos.size} contracts on market ${pos.market}`);
+}
+```
+
+<Tip>
+  Always use `BigInt` literals (e.g. `50000000n`, `1n`) for prices and quantities instead of converting from `Number`. JavaScript `Number` only guarantees exact integer representation up to 2<sup>53</sup> − 1, but price arithmetic involving large balances (e.g. `100_000_000_000n` for $100,000) can silently lose precision if you use `Number` first. The SDK's TypeScript types (`bigint`) and the engine both work exclusively with the full 64-bit integer range.
+</Tip>
+
+## Addresses — 20-byte Uint8Array
+
+Account addresses are 20-byte binary values, not strings. The `owner` field on every action payload accepts a `Uint8Array`:
+
+```typescript
+import { generateKeypair, pubkeyToOwner, ownerToHex, hexToBytes } from "@proof/trading-sdk";
+
+const { publicKey, privateKey } = generateKeypair();
+
+// Derive 20-byte address from 32-byte Ed25519 public key
+const address: Uint8Array = pubkeyToOwner(publicKey); // 20 bytes
+
+// Convert to hex for display or API query parameters
+const hex: string = ownerToHex(address); // 40 hex chars, no "0x" prefix
+
+// Parse hex back to bytes (accepts optional "0x" prefix)
+const roundTrip: Uint8Array = hexToBytes(`0x${hex}`);
+```
+
+Query endpoints such as `queryAccount()` and `queryOpenOrders()` accept either the hex string or omit the argument to use the client's own address.
+
+## Engine validation
+
+The engine validates all of these constraints at transaction time. Submitting a zero price, a fractional quantity expressed as a float-encoded bigint, or a balance that would cause arithmetic overflow all result in non-zero error codes (see [Error Codes](/concepts/error-codes) for details). The most common numeric validation errors are:
+
+- **Code 6 `InvalidPrice`** — price is zero or negative
+- **Code 7 `InvalidQuantity`** — quantity is zero or negative
+- **Code 5 `Overflow`** — arithmetic overflow during fill or margin calculation
+- **Code 39 `TickSizeViolation`** — price is not a multiple of the market's configured tick size
+- **Code 40 `LotSizeViolation`** — quantity is not a multiple of the market's configured lot size
+
+Always construct values from the source unit (dollars, percentage) using integer arithmetic and `BigInt` literals to avoid these errors.

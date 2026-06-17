@@ -1,20 +1,94 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "Proof Trading SDK"
+sidebarTitle: "Home"
+description: "The standard developer kit for signing, encoding, and submitting trading actions to the Proof Exchange — available in TypeScript, Python, and Rust."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+The Proof Trading SDK gives developers everything needed to interact with the Proof Exchange: Ed25519 key generation, MessagePack wire encoding, timestamp-nonce allocation, and HTTP/WebSocket submission to both the public gateway and CometBFT RPC. Whether you're building a trading bot, a market maker, or an analytics tool, the SDK handles the low-level protocol so you can focus on strategy.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Generate a keypair, fund an account on devnet, and place your first order in under five minutes.
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Install the TypeScript, Python, or Rust SDK and connect to the Proof devnet.
+  </Card>
+  <Card title="ExchangeClient API" icon="code" href="/api/exchange-client">
+    Full reference for every method on the ExchangeClient: submit, query, and subscribe.
+  </Card>
+  <Card title="Actions Reference" icon="list" href="/api/actions-overview">
+    All 20+ exchange action types — PlaceOrder, CancelOrder, MarketOrder, and more.
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## What's in the SDK
+
+<CardGroup cols={2}>
+  <Card title="Key Management" icon="key" href="/concepts/key-management">
+    Ed25519 keypair generation, address derivation, and signing with chain-ID binding.
+  </Card>
+  <Card title="Trading Guide" icon="chart-line" href="/guides/placing-orders">
+    Place limit orders, market orders, cancel-replace, and atomic basket orders.
+  </Card>
+  <Card title="Account & Queries" icon="magnifying-glass" href="/guides/account-queries">
+    Query balances, positions, orderbooks, tickers, and trade history.
+  </Card>
+  <Card title="Real-Time Events" icon="tower-broadcast" href="/guides/real-time-events">
+    Subscribe to live exchange events over WebSocket using the block subscription API.
+  </Card>
+  <Card title="Agent Wallets" icon="robot" href="/advanced/agent-wallets">
+    Delegate a hot wallet to trade on behalf of a cold-stored owner account.
+  </Card>
+  <Card title="Paper Trading" icon="trophy" href="/advanced/paper-trading">
+    Join the paper-trading competition with virtual funds on the real matching engine.
+  </Card>
+</CardGroup>
+
+## Supported Languages
+
+<CardGroup cols={3}>
+  <Card title="TypeScript" icon="js" href="/sdks/typescript">
+    `@proof/trading-sdk` — the primary SDK, published to npm.
+  </Card>
+  <Card title="Python" icon="python" href="/sdks/python">
+    `proof-trading-sdk` — PyO3 bindings over the shared Rust core.
+  </Card>
+  <Card title="Rust" icon="rust" href="/sdks/rust">
+    `proof-trading-sdk` — the audited Rust core used by all SDK bindings.
+  </Card>
+</CardGroup>
+
+## Quick Example
+
+```typescript
+import {
+  ExchangeClient,
+  Side,
+  generateKeypair,
+  pubkeyToOwner,
+  ownerToHex,
+} from "@proof/trading-sdk";
+
+const { publicKey, privateKey } = generateKeypair();
+const address = pubkeyToOwner(publicKey);
+
+const client = new ExchangeClient({ chainId: "exchange-devnet-1" });
+client.setPrivateKey(privateKey);
+
+const result = await client.submitTx({
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: address,
+    side: Side.Buy,
+    price: 50000000n, // $500,000.00 in cents
+    quantity: 1n,
+  },
+});
+
+console.log(result); // { code: 0, hash: "…" }
+```
+
+<Note>
+  The SDK connects to the Proof devnet by default (`https://api.dev.proof.trade`). Pin `chainId: "exchange-devnet-1"` for deterministic cross-build signatures.
+</Note>

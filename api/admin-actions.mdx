@@ -1,0 +1,579 @@
+---
+title: "Admin and Relayer Action Types"
+sidebarTitle: "Admin Actions"
+description: "Complete field reference for privileged exchange actions: OracleUpdate, CreateMarket, UpdateMarketFees, CreateImpactMarket, ResolveEvent, and supporting types."
+---
+
+Admin and relayer actions require the envelope signer's derived address to be on the engine's on-chain allowlist. Unauthorized signers receive `UnauthorizedRelayer`. These actions control oracle feeds, market creation, live parameter updates, and event resolution — operations that affect the exchange state globally rather than a single account. All type signatures are drawn directly from `src/types.ts`.
+
+---
+
+## OracleUpdate
+
+<Callout type="warning">**Relayer-only.** `signer` must be an authorized oracle signer for the target market.</Callout>
+
+Submit an oracle price update for a market. The `publishTimeMs` field must be strictly greater than the last accepted update for that market — the engine rejects stale or replayed updates with `OracleTimestampNotMonotonic` (error code 30). This monotonicity requirement was added per audit B3 (2026-04-23) as replay protection for the relayer-signed oracle feed.
+
+```typescript
+export interface OracleUpdate {
+  market: number;
+  price: bigint;
+  signer: Address;
+  publishTimeMs: bigint;
+}
+```
+
+<ParamField body="market" type="number" required>
+  Market identifier to update.
+</ParamField>
+
+<ParamField body="price" type="bigint" required>
+  New oracle price in integer cents (2 decimal places). For example, `6675234n` represents $66,752.34.
+</ParamField>
+
+<ParamField body="signer" type="Address" required>
+  Authorized oracle signer address (20 bytes). Must be the signer registered as the primary oracle for this market.
+</ParamField>
+
+<ParamField body="publishTimeMs" type="bigint" required>
+  Oracle publish timestamp in milliseconds since Unix epoch. Must be strictly greater than the last accepted oracle update timestamp for this market. Violating this constraint returns error code 30 (`OracleTimestampNotMonotonic`).
+</ParamField>
+
+```typescript
+await client.submitTx({
+  type: "OracleUpdate",
+  data: {
+    market: 1,
+    price: 6675234n,           // $66,752.34
+    signer: oracleSignerAddress,
+    publishTimeMs: BigInt(Date.now()),
+  },
+});
+```
+
+---
+
+## CreateMarket
+
+<Callout type="warning">**Admin-only.** `signer` must be on the admin allowlist.</Callout>
+
+Register a new perpetual market with its risk parameters, fee schedule, and metadata. Two fields — `szDecimals` and `ticker` — are **mandatory** on the wire: the engine's Rust struct has no `serde(default)` for them, so a payload omitting either is rejected at decode time. Both fields are fixed at creation and immutable thereafter.
+
+```typescript
+export interface CreateMarket {
+  market: number;
+  imBps: number;
+  mmBps: number;
+  takerFeeBps: number;
+  makerFeeBps: number;
+  signer: Address;
+  fundingIntervalMs: bigint;
+  maxFundingRateBps: number;
+  poolId?: number;
+  szDecimals: number;
+  ticker: string;
+}
+```
+
+<ParamField body="market" type="number" required>
+  Market identifier (unique integer). Must not already exist on the chain.
+</ParamField>
+
+<ParamField body="imBps" type="number" required>
+  Initial margin requirement in basis points (e.g., `1000` = 10% = 10x maximum leverage).
+</ParamField>
+
+<ParamField body="mmBps" type="number" required>
+  Maintenance margin requirement in basis points (e.g., `500` = 5%). Must be less than `imBps`.
+</ParamField>
+
+<ParamField body="takerFeeBps" type="number" required>
+  Taker fee rate in basis points (e.g., `5` = 0.05%).
+</ParamField>
+
+<ParamField body="makerFeeBps" type="number" required>
+  Maker fee rate in basis points (e.g., `2` = 0.02%). May be negative for a maker rebate.
+</ParamField>
+
+<ParamField body="signer" type="Address" required>
+  Authorized admin signer address (20 bytes).
+</ParamField>
+
+<ParamField body="fundingIntervalMs" type="bigint" required>
+  Funding interval in milliseconds. Pass `0n` to disable periodic funding for this market.
+</ParamField>
+
+<ParamField body="maxFundingRateBps" type="number" required>
+  Maximum absolute funding rate per interval in basis points. The engine clamps the computed rate to this value.
+</ParamField>
+
+<ParamField body="poolId" type="number">
+  Insurance-fund pool ID. Markets in different pools are insulated from each other's liquidation cascades. Omitting this field (or passing `0`) places the market in the shared default pool (pool 0).
+</ParamField>
+
+<ParamField body="szDecimals" type="number" required>
+  Published size scale: order and position `quantity` is in units of `10^-szDecimals` of the base asset. This is display and metadata only — the engine never reads it at runtime. **Mandatory on the wire.** Use `0` for integer-unit sizing.
+</ParamField>
+
+<ParamField body="ticker" type="string" required>
+  Human-readable ticker / short symbol (e.g., `"BTC"`). Display and metadata only — the engine never reads it at runtime. **Mandatory on the wire**; capped at 24 bytes by the engine. An empty string is accepted. Fixed at creation and immutable thereafter.
+</ParamField>
+
+```typescript
+await client.submitTx({
+  type: "CreateMarket",
+  data: {
+    market: 3,
+    imBps: 1000,          // 10% initial margin (10x max leverage)
+    mmBps: 500,           // 5% maintenance margin
+    takerFeeBps: 5,       // 0.05% taker fee
+    makerFeeBps: 2,       // 0.02% maker fee
+    signer: adminAddress,
+    fundingIntervalMs: 3_600_000n, // 1 hour
+    maxFundingRateBps: 100,
+    szDecimals: 0,        // integer-unit sizing (MANDATORY)
+    ticker: "SOL",        // (MANDATORY)
+  },
+});
+```
+
+---
+
+## UpdateMarketFees
+
+<Callout type="warning">**Relayer-only.** Updates live market config tunables without a chain rebase.</Callout>
+
+Update a subset of `MarketConfig` fields on an existing live market. Every tunable is optional; omitting a field (or passing `null`) leaves the current engine value untouched. Fields deliberately absent from this update path include `imBps`, `mmBps`, and `kind` — changing those on a live market would require re-margining every open position.
+
+```typescript
+export interface UpdateMarketFees {
+  market: number;
+  signer: Address;
+  takerFeeBps?: number | null;
+  makerFeeBps?: number | null;
+  maxFundingRateBps?: number | null;
+  fundingIntervalMs?: bigint | null;
+  maxPositionSize?: bigint | null;
+  defaultTtlMs?: bigint | null;
+  netDeltaMargin?: boolean | null;
+  tickSize?: bigint | null;
+  lotSize?: bigint | null;
+  primaryOracleSigner?: Address | null;
+  oracleStalenessMs?: bigint | null;
+  markSourceMode?: 0 | 1 | null;
+  maxMarkSpreadBps?: number | null;
+  cexCompositeStalenessMs?: bigint | null;
+  partialLiquidationEnabled?: boolean | null;
+  feeTiers?: FeeTier[] | null;
+}
+```
+
+<ParamField body="market" type="number" required>
+  Market identifier to update.
+</ParamField>
+
+<ParamField body="signer" type="Address" required>
+  Authorized relayer signer address (20 bytes).
+</ParamField>
+
+<ParamField body="takerFeeBps" type="number | null">
+  New taker fee in basis points. Omit to leave unchanged.
+</ParamField>
+
+<ParamField body="makerFeeBps" type="number | null">
+  New maker fee in basis points. Omit to leave unchanged. May be negative for a maker rebate.
+</ParamField>
+
+<ParamField body="maxFundingRateBps" type="number | null">
+  New maximum absolute funding rate cap in basis points per interval. Pass `0` to disable funding.
+</ParamField>
+
+<ParamField body="fundingIntervalMs" type="bigint | null">
+  New funding interval in milliseconds. Omit to leave unchanged.
+</ParamField>
+
+<ParamField body="maxPositionSize" type="bigint | null">
+  New per-account absolute position cap in contracts. Pass `0n` to disable the cap.
+</ParamField>
+
+<ParamField body="defaultTtlMs" type="bigint | null">
+  New default order TTL in milliseconds. Pass `0n` to disable the end-of-block order-expiry sweep for this market. Useful for auto-cancelling stale MM quotes.
+</ParamField>
+
+<ParamField body="netDeltaMargin" type="boolean | null">
+  Flip net-delta portfolio margin on this market. `true` = firing legs with the same underlying group into a single net position for MM/IM; `false` = per-leg scenario margin. Safe to flip on at any time; flipping off can push accounts under MM.
+</ParamField>
+
+<ParamField body="tickSize" type="bigint | null">
+  New tick size in microUSDC. Pass `0n` to disable the tick gate (any price accepted).
+</ParamField>
+
+<ParamField body="lotSize" type="bigint | null">
+  New lot size in contracts. Pass `0n` to disable the lot gate (any quantity accepted).
+</ParamField>
+
+<ParamField body="primaryOracleSigner" type="Address | null">
+  New primary oracle signer for this market (20 bytes). Pass an all-zero 20-byte address to clear the primary signer while preserving the staleness threshold. Omit to leave unchanged.
+</ParamField>
+
+<ParamField body="oracleStalenessMs" type="bigint | null">
+  Oracle staleness threshold in milliseconds. Only consulted when `primaryOracleSigner` is set on the market. Pass `0n` to disable the gate.
+</ParamField>
+
+<ParamField body="markSourceMode" type="0 | 1 | null">
+  Mark-price source mode. `0` = `OracleOnly` (legacy); `1` = `Median` (oracle + book-mid). Has no effect on impact-family child markets — those always mark off the EWMA.
+</ParamField>
+
+<ParamField body="maxMarkSpreadBps" type="number | null">
+  Thin-book spread cap in basis points for the median guard. Pass `0` to reset to the engine default (100 bps). Ignored unless `markSourceMode === 1`.
+</ParamField>
+
+<ParamField body="cexCompositeStalenessMs" type="bigint | null">
+  Maximum age in milliseconds for the composite-CEX price source. Pass `0n` to reset to the engine default (30 seconds).
+</ParamField>
+
+<ParamField body="partialLiquidationEnabled" type="boolean | null">
+  Enable partial liquidation for this market. `true` closes one position at a time and rechecks MM before continuing.
+</ParamField>
+
+<ParamField body="feeTiers" type="FeeTier[] | null">
+  Replace the rolling-volume fee-tier table. Omit to leave unchanged; pass `[]` to clear volume tiers and fall back to flat taker/maker fees.
+</ParamField>
+
+```typescript
+// Tighten the funding rate cap on market 1 (live — no chain rebase)
+await client.submitTx({
+  type: "UpdateMarketFees",
+  data: {
+    market: 1,
+    signer: relayerAddress,
+    maxFundingRateBps: 500,     // tighten from 3000 to 500 bps
+    defaultTtlMs: 60_000n,      // auto-cancel stale quotes after 60 seconds
+  },
+});
+```
+
+---
+
+## CreateImpactMarket
+
+<Callout type="warning">**Admin-only.** Creates a 5-book impact-market family (CPY/CPN/EBY/EBN child markets + parent).</Callout>
+
+Register a new impact-market event with four child order books. The optional `oracleSource` field controls how the YES/NO outcome is verified at resolution: omitting it (or passing `undefined`) defaults to `RelayerAttested`, where the resolver supplies the outcome and the engine trusts it. Setting `UnderlyingPriceVsStrike` or `MarketOracle` makes resolution self-verifying — the engine recomputes the outcome from the named oracle and rejects any `ResolveEvent` that does not match.
+
+```typescript
+export interface CreateImpactMarket {
+  impactMarketId: number;
+  underlyingMarket: number;
+  childMarketBase: number;
+  question: string;
+  deadlineMs: bigint;
+  resolutionWindowMs: bigint;
+  imBps: number;
+  mmBps: number;
+  takerFeeBps: number;
+  makerFeeBps: number;
+  fundingIntervalMs: bigint;
+  maxFundingRateBps: number;
+  signer: Address;
+  oracleSource?: EventOracleSource;
+  description?: string;
+  rules?: string;
+}
+```
+
+<ParamField body="impactMarketId" type="number" required>
+  Unique identifier for this impact-market family.
+</ParamField>
+
+<ParamField body="underlyingMarket" type="number" required>
+  Market ID of the underlying perpetual (used by auto-resolve oracle modes).
+</ParamField>
+
+<ParamField body="childMarketBase" type="number" required>
+  Base market ID for the four child books; the engine assigns IDs `childMarketBase`, `childMarketBase+1`, `childMarketBase+2`, `childMarketBase+3`.
+</ParamField>
+
+<ParamField body="question" type="string" required>
+  Event question text displayed to traders (e.g., `"Will BTC close above $70,000 on 2025-06-30?"`).
+</ParamField>
+
+<ParamField body="deadlineMs" type="bigint" required>
+  Event deadline in milliseconds since Unix epoch. After this timestamp the event enters the pre-resolution window.
+</ParamField>
+
+<ParamField body="resolutionWindowMs" type="bigint" required>
+  Duration in milliseconds of the resolution window after `deadlineMs` during which the resolver may submit `ResolveEvent`.
+</ParamField>
+
+<ParamField body="imBps" type="number" required>
+  Initial margin requirement for child books in basis points.
+</ParamField>
+
+<ParamField body="mmBps" type="number" required>
+  Maintenance margin requirement for child books in basis points.
+</ParamField>
+
+<ParamField body="takerFeeBps" type="number" required>
+  Taker fee rate for child books in basis points.
+</ParamField>
+
+<ParamField body="makerFeeBps" type="number" required>
+  Maker fee rate for child books in basis points.
+</ParamField>
+
+<ParamField body="fundingIntervalMs" type="bigint" required>
+  Funding interval for child books in milliseconds.
+</ParamField>
+
+<ParamField body="maxFundingRateBps" type="number" required>
+  Maximum absolute funding rate per interval for child books in basis points.
+</ParamField>
+
+<ParamField body="signer" type="Address" required>
+  Authorized admin signer address (20 bytes).
+</ParamField>
+
+<ParamField body="oracleSource" type="EventOracleSource">
+  Optional auto-resolve oracle source. `undefined` (wire `nil`) defaults to `RelayerAttested`. Set `UnderlyingPriceVsStrike` or `MarketOracle` for self-verifying resolution. Use `RelayerAttested` for events with no on-chain price oracle (e.g., "Did Apple announce X?").
+</ParamField>
+
+<ParamField body="description" type="string">
+  Optional event body text for frontend detail pages. Encodes as `""` when absent.
+</ParamField>
+
+<ParamField body="rules" type="string">
+  Optional resolution criteria text. Encodes as `""` when absent.
+</ParamField>
+
+### EventOracleSource
+
+Controls how the YES/NO outcome of an impact market is determined at deadline.
+
+```typescript
+export type EventOracleSource =
+  | {
+      kind: "UnderlyingPriceVsStrike";
+      strikePrice: bigint;
+      comparison: PriceComparison;
+    }
+  | {
+      kind: "MarketOracle";
+      market: number;
+      strikePrice: bigint;
+      comparison: PriceComparison;
+    }
+  | { kind: "RelayerAttested" };
+```
+
+| Variant | Description |
+|---|---|
+| `UnderlyingPriceVsStrike` | Resolves YES iff `underlyingMarket.oraclePrice <comparison> strikePrice` at deadline |
+| `MarketOracle` | Resolves YES iff the named market's oracle price `<comparison> strikePrice` at deadline |
+| `RelayerAttested` | The relayer supplies the outcome and the engine trusts it (legacy default) |
+
+### PriceComparison
+
+```typescript
+export type PriceComparison =
+  | "GreaterThan"
+  | "LessThan"
+  | "GreaterThanOrEqual"
+  | "LessThanOrEqual";
+```
+
+The YES branch fires when `oracle_price <comparison> strike_price`. For example, `"GreaterThan"` means the event resolves YES when the oracle reading is strictly greater than the strike price.
+
+```typescript
+// Create an impact market that auto-resolves based on BTC oracle price
+await client.submitTx({
+  type: "CreateImpactMarket",
+  data: {
+    impactMarketId: 100,
+    underlyingMarket: 1,       // BTC-PERP
+    childMarketBase: 1000,
+    question: "Will BTC close above $70,000 on 2025-06-30?",
+    deadlineMs: 1751241600000n,
+    resolutionWindowMs: 86_400_000n, // 24 hours
+    imBps: 2000,
+    mmBps: 1000,
+    takerFeeBps: 10,
+    makerFeeBps: 5,
+    fundingIntervalMs: 3_600_000n,
+    maxFundingRateBps: 100,
+    signer: adminAddress,
+    oracleSource: {
+      kind: "UnderlyingPriceVsStrike",
+      strikePrice: 7_000_000n,   // $70,000.00 in integer cents
+      comparison: "GreaterThan",
+    },
+    description: "Resolves YES if BTC oracle closes strictly above $70,000.",
+    rules: "Uses the BTC-PERP primary oracle price at the deadline block.",
+  },
+});
+```
+
+---
+
+## ResolveEvent
+
+<Callout type="warning">**Relayer-only.** If `oracleSource` is set to an auto-resolve mode, the engine recomputes the outcome and rejects a mismatched `outcome`. `Outcome.Void` overrides auto-derivation in either mode (operator escape hatch).</Callout>
+
+Resolve an impact-market event with a final outcome. This settles all positions across the four child books and transitions the family status to `Resolved`.
+
+```typescript
+export interface ResolveEvent {
+  impactMarketId: number;
+  outcome: Outcome;
+  signer: Address;
+}
+```
+
+<ParamField body="impactMarketId" type="number" required>
+  Impact-market family ID to resolve.
+</ParamField>
+
+<ParamField body="outcome" type="Outcome" required>
+  Final outcome. `Outcome.Yes` (1), `Outcome.No` (2), or `Outcome.Void` (3). For auto-resolve markets, the engine verifies `Yes` or `No` against the oracle; `Void` always passes as an operator override.
+</ParamField>
+
+<ParamField body="signer" type="Address" required>
+  Authorized relayer signer address (20 bytes).
+</ParamField>
+
+```typescript
+import { Outcome } from "@proof/trading-sdk";
+
+await client.submitTx({
+  type: "ResolveEvent",
+  data: {
+    impactMarketId: 100,
+    outcome: Outcome.Yes,
+    signer: relayerAddress,
+  },
+});
+```
+
+### Outcome Enum
+
+```typescript
+export enum Outcome {
+  Yes  = 1,
+  No   = 2,
+  Void = 3,
+}
+```
+
+---
+
+## FeeTier
+
+The `FeeTier` interface defines one row in the rolling-volume fee schedule used by `UpdateMarketFees.feeTiers` and stored in `MarketConfig.feeTiers`.
+
+```typescript
+export interface FeeTier {
+  min30dVolumeMicroUsdc: bigint;
+  makerFeeTenthBps: number;
+  takerFeeTenthBps: number;
+}
+```
+
+<ParamField body="min30dVolumeMicroUsdc" type="bigint" required>
+  Minimum 30-day rolling taker volume in microUSDC required to qualify for this tier. The engine selects the highest tier for which the account's `volume30dMicroUsdc >= min30dVolumeMicroUsdc`.
+</ParamField>
+
+<ParamField body="makerFeeTenthBps" type="number" required>
+  Maker fee in tenth-basis-points. A negative value represents a maker rebate. For example, `-5` = −0.005% rebate; `20` = 0.02% fee.
+</ParamField>
+
+<ParamField body="takerFeeTenthBps" type="number" required>
+  Taker fee in tenth-basis-points. For example, `50` = 0.05%.
+</ParamField>
+
+```typescript
+// Set a three-tier fee schedule on market 1
+await client.submitTx({
+  type: "UpdateMarketFees",
+  data: {
+    market: 1,
+    signer: relayerAddress,
+    feeTiers: [
+      {
+        min30dVolumeMicroUsdc: 0n,                    // base tier
+        makerFeeTenthBps: 20,                         // 0.02% maker
+        takerFeeTenthBps: 50,                         // 0.05% taker
+      },
+      {
+        min30dVolumeMicroUsdc: 1_000_000_000_000n,    // $1M 30d volume
+        makerFeeTenthBps: 10,                         // 0.01% maker
+        takerFeeTenthBps: 40,                         // 0.04% taker
+      },
+      {
+        min30dVolumeMicroUsdc: 10_000_000_000_000n,   // $10M 30d volume
+        makerFeeTenthBps: -5,                         // −0.005% maker rebate
+        takerFeeTenthBps: 30,                         // 0.03% taker
+      },
+    ],
+  },
+});
+```
+
+---
+
+## MarketKind
+
+The `MarketKind` discriminated union identifies what kind of market a `MarketConfig` represents. The wire shape mirrors the Rust `MarketKind` enum exactly.
+
+```typescript
+export type MarketKind =
+  | "Perp"
+  | { ConditionalPerp:    [number, "Yes" | "No"] }
+  | { PredictionBinary:   [number, "Yes" | "No"] };
+```
+
+| Variant | Wire Shape | Description |
+|---|---|---|
+| `"Perp"` | Bare string `"Perp"` | Standard perpetual futures market |
+| `{ ConditionalPerp: [id, branch] }` | Object with `impactMarketId` and branch | Conditional perpetual child of an impact-market family |
+| `{ PredictionBinary: [id, branch] }` | Object with `impactMarketId` and branch | Binary prediction child of an impact-market family |
+
+---
+
+## MarketConfig
+
+`MarketConfig` is the full on-chain configuration record for a market, returned by market query endpoints. The wire format is a MessagePack positional array; indices mirror the Rust struct field order.
+
+```typescript
+export interface MarketConfig {
+  market: number;           // [0]
+  imBps: number;            // [1]
+  mmBps: number;            // [2]
+  takerFeeBps: number;      // [3]
+  makerFeeBps: number;      // [4]
+  fundingIntervalMs: bigint; // [5]
+  maxFundingRateBps: number; // [6]
+  kind?: MarketKind;         // [7]  defaults to "Perp"
+  maxPositionSize?: bigint;  // [8]  0 = no limit
+  defaultTtlMs?: bigint;     // [9]  0 = no TTL
+  netDeltaMargin?: boolean;  // [10]
+  poolId?: number;           // [11] 0 = shared default pool
+  markPriceMaxOracleAgeMs?: bigint; // [12] 0 = no check
+  feeTiers?: FeeTier[];      // [13] empty = flat fees
+  tickSize?: bigint;         // [14] 0 = no tick gate
+  lotSize?: bigint;          // [15] 0 = no lot gate
+  primaryOracleSigner?: Address; // [16]
+  oracleStalenessMs?: bigint;    // [17] 0 = disabled
+  markSourceMode?: MarkSourceMode; // [18]
+  maxMarkSpreadBps?: number;     // [19]
+  cexCompositeStalenessMs?: bigint; // [20]
+  partialLiquidationEnabled?: boolean; // [21]
+  szDecimals?: number;       // [22] quantity scale
+  ticker?: string;           // [23] human-readable symbol
+}
+```
+
+Fields after index 7 use `serde(default)` so older on-chain records decode cleanly without those fields. The `markSourceMode` type alias is:
+
+```typescript
+export type MarkSourceMode = "OracleOnly" | "Median";
+```

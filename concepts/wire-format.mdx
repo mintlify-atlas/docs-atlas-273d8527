@@ -1,0 +1,204 @@
+---
+title: "Transaction Wire Format and Signing Protocol"
+sidebarTitle: "Wire Format"
+description: "MessagePack positional array layout, v3 signing message construction, chain ID binding, sequence nonce allocation, and action type byte constants."
+---
+
+Every transaction submitted to the Proof Exchange is a **MessagePack-encoded positional array** containing a version tag, action type byte, sequence nonce, serialized payload, public key, and Ed25519 signature. Understanding this format is useful when debugging signature mismatches, integrating non-TypeScript SDKs, or building conformance tests across language implementations.
+
+## Wire envelope structure
+
+The top-level envelope is a 6-element MessagePack array:
+
+```
+[version, action_type, seq, payload, pubkey(32B), signature(64B)]
+```
+
+| Index | Field | Type | Notes |
+|---|---|---|---|
+| 0 | `version` | uint (fixed `2`) | Wire protocol version. The SDK always emits `2`. |
+| 1 | `action_type` | uint8 | One-byte action identifier (see table below). |
+| 2 | `seq` | uint64 | Timestamp nonce in milliseconds. |
+| 3 | `payload` | bin | MessagePack-encoded action field array (nested). |
+| 4 | `pubkey` | bin (32 bytes) | Ed25519 public key of the signer. Encoded as msgpack `bin` via `serde_bytes`. |
+| 5 | `signature` | bin (64 bytes) | Ed25519 signature over the signing message. Encoded as msgpack `bin` via `serde_bytes`. |
+
+The `payload` field (index 3) is itself a MessagePack-encoded **positional array** whose field order matches the corresponding Rust struct definition. The SDK's `encodePayload()` in `src/codec.ts` is the authoritative source of these layouts.
+
+## Action type constants
+
+The `ActionType` object in `src/types.ts` defines the wire byte for each action:
+
+```typescript
+export const ActionType = {
+  PlaceOrder:           0x01,
+  CancelOrder:          0x02,
+  OracleUpdate:         0x03,
+  MarketOrder:          0x04,
+  Deposit:              0x05,
+  Withdraw:             0x06,
+  CreateMarket:         0x07,
+  WithdrawRequest:      0x08,
+  ConfirmDeposit:       0x09,
+  ConfirmWithdrawal:    0x0a,
+  FailWithdrawal:       0x0b,
+  ApproveAgent:         0x0c,
+  RevokeAgent:          0x0d,
+  CreateImpactMarket:   0x0e,
+  ResolveEvent:         0x0f,
+  UpdateMarketFees:     0x10,
+  SetUserMarketLeverage: 0x16,
+  ClosePosition:        0x17,
+  CancelClientOrder:    0x18,
+  CancelAllOrders:      0x19,
+  CancelReplaceOrder:   0x1a,
+  AmendOrder:           0x1b,
+  AtomicBasketOrder:    0x1c,
+} as const;
+```
+
+These byte values are stable wire identifiers. A new action type is always appended with the next free byte; existing values never change.
+
+## Signing message (v3 layout)
+
+The bytes passed to `ed25519.sign()` are **not** the raw wire envelope. They are a separate, deterministic signing message constructed by `signingMessage()` in `src/crypto.ts`:
+
+```
+DOMAIN_PREFIX(16B) || chain_id(32B) || action_type(1B) || seq_be(8B) || payload
+```
+
+| Region | Size | Content |
+|---|---|---|
+| Domain prefix | 16 bytes | ASCII `ProofExchange-v3` |
+| Chain ID | 32 bytes | `keccak256(cometbft_chain_id_string)` |
+| Action type | 1 byte | Same byte as envelope index 1 |
+| Sequence | 8 bytes | `seq` as big-endian unsigned 64-bit integer |
+| Payload | variable | The same MessagePack bytes stored in envelope index 3 |
+
+The domain prefix was bumped from `v2` to `v3` on 2026-04-23 (audit finding B4) when the 32-byte `chain_id` field was added. A transaction signed under v2 produces a different signing message and fails verification against a v3 engine.
+
+```typescript
+// From src/crypto.ts — the canonical signing message builder
+export function signingMessage(
+  chainId: Uint8Array,   // must be exactly 32 bytes
+  actionType: number,
+  seq: bigint,
+  payload: Uint8Array,
+): Uint8Array {
+  const msg = new Uint8Array(
+    DOMAIN_PREFIX.length + 32 + 1 + 8 + payload.length,
+  );
+  let offset = 0;
+  msg.set(DOMAIN_PREFIX, offset);     offset += DOMAIN_PREFIX.length;
+  msg.set(chainId, offset);           offset += 32;
+  msg[offset++] = actionType;
+  const view = new DataView(msg.buffer, msg.byteOffset + offset, 8);
+  view.setBigUint64(0, seq, false);   // false = big-endian
+  offset += 8;
+  msg.set(payload, offset);
+  return msg;
+}
+```
+
+## Chain ID binding
+
+The 32-byte chain ID is `keccak256` of the CometBFT `chain_id` string, produced by `chainIdFromString()`:
+
+```typescript
+import { chainIdFromString, UNBOUND_CHAIN_ID } from "@proof/trading-sdk";
+
+// Production use — bind to a specific deployment
+const chainId = chainIdFromString("exchange-devnet-1");
+
+// UNBOUND_CHAIN_ID is all-zero 32 bytes — for offline and unit tests ONLY.
+// Signatures using UNBOUND_CHAIN_ID are replayable on any other zero-chain_id
+// deployment and must never be submitted to a production engine.
+```
+
+`ExchangeClient` resolves and caches the chain ID automatically. Pass `chainId` explicitly in the constructor options to skip the network fetch:
+
+```typescript
+const client = new ExchangeClient({ chainId: "exchange-devnet-1" });
+```
+
+## Sequence (timestamp nonce)
+
+The `seq` field is a **millisecond Unix timestamp** used as a nonce. The SDK allocates it as `max(now_ms, last_nonce + 1)`, guaranteeing strict monotonicity within a single process even when transactions are submitted faster than 1 ms apart.
+
+The engine validates `seq` against a **sliding window**. A `seq` value that is too far in the past, too far in the future, or has already been used results in **code 21 `TimestampNonceRejected`**. The recommended handling is a simple retry — the SDK automatically advances the nonce on the next call:
+
+```typescript
+const r = await client.submitTx(action);
+if (r.code === 21) {
+  // Nonce collision (rare) — retry once; the SDK advances the nonce
+  const retried = await client.submitTx(action);
+}
+```
+
+## `signAndEncode()` function
+
+Most users go through `ExchangeClient.submitTx()` which handles signing internally. When you need direct access to the signed wire bytes — for example to POST them to a custom endpoint or inspect them — use `signAndEncode()`:
+
+```typescript
+import {
+  signAndEncode,
+  chainIdFromString,
+  Action,
+  Side,
+} from "@proof/trading-sdk";
+
+const chainId = chainIdFromString("exchange-devnet-1");
+
+const action: Action = {
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: address,        // 20-byte Uint8Array
+    side: Side.Buy,
+    price: 6675234n,       // $66,752.34 in cents
+    quantity: 1n,
+  },
+};
+
+const seq = BigInt(Date.now()); // millisecond timestamp nonce
+
+// Returns a ready-to-POST Uint8Array
+const txBytes = signAndEncode(chainId, action, seq, privateKey);
+```
+
+The function signature from `src/codec.ts`:
+
+```typescript
+export function signAndEncode(
+  chainId: Uint8Array,   // 32-byte chain ID (use chainIdFromString)
+  action: Action,        // discriminated union from src/types.ts
+  seq: bigint,           // millisecond timestamp nonce
+  privateKey: Uint8Array // 32-byte Ed25519 private key
+): Uint8Array
+```
+
+For paths that already hold a pre-computed signature (e.g. hardware signing), use `encodeSignedTx()` instead:
+
+```typescript
+export function encodeSignedTx(
+  action: Action,
+  seq: bigint,
+  pubkey: Uint8Array,     // 32-byte Ed25519 public key
+  signature: Uint8Array   // 64-byte Ed25519 signature
+): Uint8Array
+```
+
+## Minimal-integer compatibility
+
+The Rust MessagePack library (`rmp-serde`) encodes all integers in their **minimal form** — a value of `1` is a 1-byte positive fixint, not a 9-byte uint64. The TypeScript SDK replicates this by converting `BigInt` values that fit in a `u32` (`0..=4294967295`) to plain `Number` before encoding:
+
+```
+BigInt 0..=4294967295  → Number → @msgpack/msgpack encodes as fixint/uint8/uint16/uint32
+BigInt > 4294967295    → BigInt → @msgpack/msgpack encodes as uint64 (9 bytes)
+```
+
+This conversion is applied recursively to every action payload before it is MessagePack-encoded. The result is byte-for-byte identical to what the Rust encoder produces, which is required for signature verification to pass.
+
+<Note>
+  Do not encode payload bytes yourself using `@msgpack/msgpack` with `useBigInt64: true` on every field — small bigint values would be emitted as 9-byte uint64 rather than minimal fixints, producing payload bytes that differ from what the engine re-encodes and causing signature failures (code 17).
+</Note>

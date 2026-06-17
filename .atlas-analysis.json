@@ -1,24 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Proof Trading SDK",
+  "projectType": "sdk-library",
+  "projectName": "Proof Trading SDK",
+  "projectDescription": "A multi-language SDK (TypeScript, Python, Rust) for signing, encoding, querying, and submitting trading actions to the Proof Exchange — a perpetual futures exchange built on CometBFT.",
   "theme": "luma",
-  "colors": {
-    "primary": "#505050",
-    "light": "#1c1c1c",
-    "dark": "#b6b6b6"
-  },
-  "favicon": "https://media.brand.dev/13b210d3-9a1f-484d-b07f-bbc486a70c50.png",
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/Proof-labs/trading-sdk"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/Proof-labs/trading-sdk"
-    }
-  },
+  "primaryColor": "#505050",
+  "lightColor": "#1c1c1c",
+  "darkColor": "#b6b6b6",
   "navigation": {
     "tabs": [
       {
@@ -104,5 +91,43 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Ed25519 key generation and signing with chain-ID binding",
+    "MessagePack codec with rmp-serde-compatible minimal-int encoding",
+    "Timestamp-nonce allocation with replay-window protection",
+    "Gateway and CometBFT submission with fire-and-forget or commit modes",
+    "Full query surface: orderbook, account, markets, ticker, history, ADL queue",
+    "WebSocket block subscription for real-time exchange events",
+    "Python bindings via PyO3 over shared Rust core",
+    "Agent wallet delegation for programmatic/bot trading",
+    "Atomic multi-leg basket orders (fill-or-kill)",
+    "Discriminated-union Action type covering all 20+ exchange operations"
+  ],
+  "publicApiSurface": [
+    "ExchangeClient",
+    "ExchangeClientOptions",
+    "generateKeypair()",
+    "pubkeyToOwner()",
+    "ownerToHex()",
+    "hexToBytes()",
+    "bytesToHex()",
+    "signAndEncode()",
+    "decodeTx()",
+    "fetchChainId()",
+    "chainIdFromString()",
+    "decodeExecError()",
+    "execErrorName()",
+    "Action (discriminated union)",
+    "Side (enum: Buy | Sell)",
+    "TimeInForce (enum: Gtc | Ioc | Fok)",
+    "ActionType (wire byte constants)",
+    "TxResult",
+    "ExchangeEvent",
+    "PlaceOrder, CancelOrder, CancelAllOrders, CancelReplaceOrder, AmendOrder",
+    "MarketOrder, ClosePosition, AtomicBasketOrder",
+    "ApproveAgent, RevokeAgent",
+    "WithdrawRequest, ConfirmDeposit",
+    "AccountInfo, PositionInfo, Orderbook, OpenOrder, Ticker, MarketConfig"
+  ]
 }

@@ -1,0 +1,409 @@
+---
+title: "Querying Market Data and Account State"
+sidebarTitle: "Account Queries"
+description: "Fetch orderbooks, market configs, tickers, open orders, account margin, withdrawal records, history, and chain state using the Proof Trading SDK."
+---
+
+The Proof Exchange exposes a rich set of read endpoints through `ExchangeClient`. All query methods return strongly-typed responses decoded from MessagePack — you never parse raw JSON or handle binary formats directly. This guide covers every query available, grouped by category, with concrete response shapes and usage examples.
+
+---
+
+## Client Setup
+
+```typescript
+import {
+  ExchangeClient,
+  generateKeypair,
+  pubkeyToOwner,
+  ownerToHex,
+} from "@proof/trading-sdk";
+
+const { publicKey, privateKey } = generateKeypair();
+const address = pubkeyToOwner(publicKey);
+const addressHex = ownerToHex(address);
+
+const client = new ExchangeClient({ chainId: "exchange-devnet-1" });
+client.setPrivateKey(privateKey);
+```
+
+---
+
+## Market Data
+
+### Orderbook
+
+`queryOrderbook(market)` returns a snapshot of the best bids and asks for a market.
+
+```typescript
+const book = await client.queryOrderbook(1);
+
+// book: Orderbook
+// {
+//   bids: OrderbookLevel[],  // sorted best (highest price) first
+//   asks: OrderbookLevel[],  // sorted best (lowest price) first
+// }
+
+console.log("Best bid:", book.bids[0]);
+// { price: 4999900n, totalQty: 5n, orderCount: 3 }
+
+console.log("Best ask:", book.asks[0]);
+// { price: 5000100n, totalQty: 2n, orderCount: 1 }
+```
+
+Each `OrderbookLevel` contains:
+
+| Field | Type | Description |
+|---|---|---|
+| `price` | `bigint` | Price in cents (2 dp). `4999900n` = $49,999.00 |
+| `totalQty` | `bigint` | Total resting quantity at this level (integer contracts) |
+| `orderCount` | `number` | Number of individual orders at this price |
+
+```typescript
+// Print depth table
+const toUsd = (cents: bigint) => (Number(cents) / 100).toFixed(2);
+
+console.log("─── ASKS ───");
+for (const ask of [...book.asks].reverse()) {
+  console.log(`$${toUsd(ask.price).padStart(12)}  ${ask.totalQty} lots  (${ask.orderCount} orders)`);
+}
+console.log("─── BIDS ───");
+for (const bid of book.bids) {
+  console.log(`$${toUsd(bid.price).padStart(12)}  ${bid.totalQty} lots  (${bid.orderCount} orders)`);
+}
+```
+
+---
+
+### Market Configs
+
+`queryMarkets()` returns configuration for every registered market, including risk parameters, fee rates, and funding settings.
+
+```typescript
+const markets = await client.queryMarkets();
+
+// Filter for perpetual markets only
+const perps = markets.filter((m) => m.kind === "Perp" || !m.kind);
+
+for (const m of perps) {
+  console.log({
+    market: m.market,
+    ticker: m.ticker,        // e.g. "BTC"
+    imBps: m.imBps,          // initial margin in bps (1000 = 10% = 10x max)
+    mmBps: m.mmBps,          // maintenance margin in bps
+    takerFeeBps: m.takerFeeBps,
+    makerFeeBps: m.makerFeeBps,
+    fundingIntervalMs: m.fundingIntervalMs,
+    maxFundingRateBps: m.maxFundingRateBps,
+  });
+}
+```
+
+Key `MarketConfig` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `market` | `number` | Market identifier |
+| `imBps` | `number` | Initial margin in bps (e.g. `1000` = 10% = 10x max leverage) |
+| `mmBps` | `number` | Maintenance margin in bps (e.g. `500` = 5%) |
+| `takerFeeBps` | `number` | Taker fee rate in bps |
+| `makerFeeBps` | `number` | Maker fee rate in bps |
+| `fundingIntervalMs` | `bigint` | Funding tick interval in ms (`0` = disabled) |
+| `maxFundingRateBps` | `number` | Maximum absolute funding rate per interval |
+| `kind` | `MarketKind?` | `"Perp"`, `{ ConditionalPerp: [...] }`, or `{ PredictionBinary: [...] }` |
+| `ticker` | `string?` | Human-readable symbol (e.g. `"BTC"`) |
+| `tickSize` | `bigint?` | Minimum price increment in micro-USDC (`0` = no gate) |
+| `lotSize` | `bigint?` | Minimum order quantity in contracts (`0` = no gate) |
+| `feeTiers` | `FeeTier[]?` | Volume-based fee tiers (overrides flat rates) |
+
+---
+
+### Ticker
+
+`queryTicker(market)` returns a one-round-trip 24-hour summary for a market.
+
+```typescript
+const ticker = await client.queryTicker(1);
+
+if (!ticker) {
+  console.log("Market not found");
+} else {
+  console.log({
+    market: ticker.market,              // "1"
+    lastPrice: ticker.lastPrice,        // "$66,752.34" as cents string, e.g. "6675234"
+    volume24hContracts: ticker.volume24hContracts, // total contracts traded in 24h
+    change24hBps: ticker.change24hBps,  // signed 24h change in bps, e.g. "+150" = +1.5%
+    fundingMsgpackB64: ticker.fundingMsgpackB64,   // base64 msgpack FundingInfo blob
+    orderbookMsgpackB64: ticker.orderbookMsgpackB64, // base64 msgpack top-of-book snapshot
+    openInterest: ticker.openInterest, // always null today
+  });
+}
+```
+
+<Note>
+  All `Ticker` fields are strings (including numeric values). `openInterest` is always `null` — the engine does not track open interest yet. Render it as `"—"` in UIs.
+</Note>
+
+---
+
+### Open Orders
+
+`queryOpenOrders(addressHex?)` returns all resting orders for an account. Omit the address to query the connected wallet.
+
+```typescript
+const orders = await client.queryOpenOrders();
+// or: await client.queryOpenOrders("0xabc123...")
+
+for (const order of orders) {
+  console.log({
+    id: order.id,          // bigint engine-assigned order ID
+    market: order.market,  // number
+    side: order.side,      // "Buy" | "Sell"
+    price: order.price,    // bigint cents
+    quantity: order.quantity, // bigint contracts
+  });
+}
+```
+
+`OpenOrder` shape:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `bigint` | Engine-assigned order ID (use for `CancelOrder`) |
+| `market` | `number` | Market identifier |
+| `owner` | `Uint8Array` | 20-byte owner address |
+| `side` | `"Buy"` / `"Sell"` | Order side |
+| `price` | `bigint` | Limit price in cents |
+| `quantity` | `bigint` | Remaining resting quantity in contracts |
+
+---
+
+## Account Data
+
+### Account Info
+
+`queryAccount(addressHex?)` returns the full account state — balance, positions, and margin metrics.
+
+```typescript
+const account = await client.queryAccount();
+
+if (!account) {
+  console.log("No account on-chain yet (no deposit recorded)");
+} else {
+  const toUsd = (n: bigint) => (Number(n) / 1_000_000).toFixed(2);
+
+  console.log({
+    balance: `$${toUsd(account.balance)}`,     // available USDC
+    equity: `$${toUsd(account.equity)}`,       // balance + unrealized PnL
+    totalMm: `$${toUsd(account.totalMm)}`,     // maintenance margin requirement
+    totalIm: `$${toUsd(account.totalIm)}`,     // initial margin requirement
+    marginRatioBps: account.marginRatioBps,    // equity/notional in bps
+    positions: account.positions.length,
+    feesAccrued: account.feesAccrued !== undefined
+      ? `$${toUsd(account.feesAccrued)}`
+      : "n/a (older gateway)",
+    volume30dMicroUsdc: account.volume30dMicroUsdc,
+  });
+}
+```
+
+`AccountInfo` shape:
+
+| Field | Index | Type | Description |
+|---|---|---|---|
+| `balance` | 0 | `bigint` | Available USDC in microUSDC |
+| `positions` | 1 | `PositionInfo[]` | Open positions |
+| `equity` | 2 | `bigint` | `balance + unrealized PnL` (scenario-aware worst-case) |
+| `totalMm` | 3 | `bigint` | Total maintenance margin requirement in microUSDC |
+| `totalIm` | 4 | `bigint` | Total initial margin requirement in microUSDC |
+| `marginRatioBps` | 5 | `bigint` | Margin ratio in basis points |
+| `bindingScenario` | 6 | `BindingScenarioEntry[]?` | Worst-case resolution scenario (impact markets only) |
+| `feesAccrued` | 7 | `bigint?` | Cumulative fees paid / rebates received in microUSDC |
+| `volume30dMicroUsdc` | 8 | `bigint?` | Rolling 30-day taker volume for fee tier selection |
+
+<Tip>
+  Convenience wrappers `client.queryBalance()` and `client.queryEquity()` return just the `balance` or `equity` field without the full object — useful for lightweight polling loops.
+</Tip>
+
+---
+
+### Withdrawal Record
+
+`queryWithdrawal(id)` looks up a withdrawal by its engine-assigned ID. Returns `null` if the ID is not found.
+
+```typescript
+const record = await client.queryWithdrawal(7n);
+
+if (!record) {
+  console.log("Withdrawal not found");
+} else {
+  console.log({
+    id: record.id,
+    amount: record.amount,          // bigint microUSDC
+    status: record.status,          // "Pending" | "Completed" | "Failed"
+    requestHeight: record.requestHeight, // bigint block height
+    solanaDestination: record.solanaDestination, // Uint8Array (32 bytes)
+  });
+}
+```
+
+---
+
+### ADL Queue
+
+`queryAdlQueue(market)` returns profitable positions ranked by ADL score (descending). Positions at the front of the queue are most likely to be auto-deleveraged if bad debt is not covered by the insurance fund.
+
+```typescript
+const queue = await client.queryAdlQueue(1);
+
+console.log(`Market 1 ADL queue: ${queue.length} entries`);
+for (const entry of queue.slice(0, 5)) {
+  console.log({
+    side: entry.side,
+    size: entry.size,       // bigint contracts
+    upnlNow: entry.upnlNow, // bigint microUSDC (always positive here)
+    adlScore: entry.adlScore,
+  });
+}
+```
+
+---
+
+## History
+
+All history endpoints accept optional filter parameters: `fromMs`, `toMs` (Unix milliseconds), and `limit`. Results are newest-first and capped server-side.
+
+### Deposit History
+
+```typescript
+const deposits = await client.queryHistoryDeposits(addressHex, {
+  fromMs: Date.now() - 30 * 24 * 60 * 60 * 1000, // last 30 days
+  limit: 50,
+});
+
+for (const d of deposits) {
+  console.log({
+    kind: d.kind,             // "deposit_confirmed"
+    amount: d.amount,         // µUSDC as string
+    newBalance: d.newBalance, // post-deposit balance as string
+    solanaTxSig: d.solanaTxSig,
+    blockHeight: d.blockHeight,
+    timestamp: new Date(d.timestamp).toISOString(),
+  });
+}
+```
+
+### Withdrawal History
+
+```typescript
+const withdrawals = await client.queryHistoryWithdrawals(addressHex, {
+  limit: 100,
+});
+
+// Filter client-side by status kind
+const pending = withdrawals.filter((w) => w.kind === "withdraw_requested");
+const completed = withdrawals.filter((w) => w.kind === "withdrawal_confirmed");
+const failed = withdrawals.filter((w) => w.kind === "withdrawal_failed");
+
+console.log(`Pending: ${pending.length}, Completed: ${completed.length}, Failed: ${failed.length}`);
+```
+
+`HistoryCashFlow` kinds:
+
+| `kind` | Signed delta | Description |
+|---|---|---|
+| `deposit_confirmed` | `+amount` | USDC credited from Solana bridge |
+| `withdraw_requested` | `-amount` | Withdrawal deducted from balance |
+| `withdrawal_confirmed` | `0` | Solana transaction confirmed (no balance change) |
+| `withdrawal_failed` | `+amount` | Failed withdrawal refunded to balance |
+
+### Resolution History
+
+`queryHistoryResolutions()` returns positions that were settled when an impact market resolved.
+
+```typescript
+const resolutions = await client.queryHistoryResolutions(addressHex, {
+  limit: 20,
+});
+
+for (const r of resolutions) {
+  console.log({
+    kind: r.kind,              // "conditional_settled" | "conditional_voided" | "prediction_settled"
+    market: r.market,
+    side: r.side,
+    size: r.size,
+    entryPrice: r.entryPrice,
+    settlementPrice: r.settlementPrice,
+    realizedPnl: r.realizedPnl, // signed µUSDC
+    timestamp: new Date(r.timestamp).toISOString(),
+  });
+}
+```
+
+### Position Snapshots
+
+`queryHistoryPositions()` returns point-in-time snapshots after each fill. A row with `size === "0"` is a close event.
+
+```typescript
+const snapshots = await client.queryHistoryPositions(addressHex, {
+  market: 1,
+  fromMs: Date.now() - 7 * 24 * 60 * 60 * 1000,
+  limit: 200,
+});
+
+// Reconstruct position entry/exit pairs
+const closes = snapshots.filter((s) => s.size === "0");
+console.log(`Closed ${closes.length} positions on market 1 this week`);
+
+for (const snap of snapshots) {
+  console.log({
+    side: snap.side,
+    entryPrice: snap.entryPrice,
+    size: snap.size === "0" ? "(closed)" : snap.size,
+    blockHeight: snap.blockHeight,
+    timestamp: new Date(snap.timestamp).toISOString(),
+  });
+}
+```
+
+---
+
+## Chain State
+
+### Node Status
+
+```typescript
+const status = await client.status();
+
+console.log({
+  latestHeight: status.latestHeight,   // number
+  latestAppHash: status.latestAppHash, // hex string
+});
+```
+
+### Health Check
+
+```typescript
+const health = await client.queryHealth();
+
+console.log({
+  status: health.status,  // e.g. "ok"
+  height: health.height,  // current block height
+});
+```
+
+### Block and Block Results
+
+```typescript
+// Fetch the latest block
+const latestBlock = await client.getBlock();
+
+// Fetch a specific block by height
+const block = await client.getBlock(12345);
+
+// Fetch ABCI results for a block (contains tx execution events)
+const results = await client.getBlockResults(12345);
+```
+
+<Note>
+  `getBlock()` and `getBlockResults()` return raw CometBFT JSON objects typed as `Record<string, unknown>`. Parse the structure you need directly — the SDK does not decode these into typed structs.
+</Note>

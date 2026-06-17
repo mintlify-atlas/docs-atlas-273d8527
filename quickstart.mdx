@@ -1,47 +1,241 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with the Proof Trading SDK in Minutes"
+sidebarTitle: "Quickstart"
+description: "Install the Proof Trading SDK, generate an Ed25519 keypair, fund via devnet faucet, and place your first limit order on the Proof Exchange."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+This guide walks you through the complete flow from a blank Node.js project to a confirmed limit order on the Proof devnet. The Proof Exchange runs on CometBFT and every action — from key generation to order submission — happens entirely over HTTP, with no node software to install or manage locally.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+### Install the SDK
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+Add the `@proof/trading-sdk` package to your project:
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
+```bash
+npm install @proof/trading-sdk
+```
+
+The package is a pure ESM module. Make sure your `package.json` includes `"type": "module"` and that you are running Node.js 18 or later.
+
+### Generate a keypair and derive your address
+
+Key generation is fully local — no network request is needed. The SDK derives your 20-byte owner address from your Ed25519 public key using `keccak256(pubkey)[12..32]`:
+
+```typescript
+import { generateKeypair, pubkeyToOwner, ownerToHex } from "@proof/trading-sdk";
+
+const { publicKey, privateKey } = generateKeypair();
+const address = pubkeyToOwner(publicKey);       // Uint8Array (20 bytes)
+const addressHex = ownerToHex(address);         // hex string, no 0x prefix
+
+console.log(`0x${addressHex}`); // your new address
+```
+
+<Warning>
+  Store `privateKey` (a `Uint8Array`) securely. It cannot be recovered from the address alone. Never log or commit private keys to source control.
+</Warning>
+
+### Fund your address via the devnet faucet
+
+The devnet faucet drips approximately 10,000 USDC (10,000,000,000 µUSDC) to any address, with a 24-hour cooldown per address. You need a faucet token to call the endpoint:
+
+```bash
+curl -X POST https://faucet.dev.proof.trade/drip \
+  -H "Authorization: Bearer $PROOF_FAUCET_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"address": "0x<your-hex-address>"}'
+```
+
+<Note>
+  If you are a paper-trading competition participant, do **not** use the faucet flow above — it requires a privileged token you will not have. You receive a pre-funded private key by redeeming your access code instead.
+</Note>
+
+After funding, wait a few seconds for the deposit transaction to be included in a block before querying your balance.
+
+### Create an ExchangeClient and load your private key
+
+Construct an `ExchangeClient` with the devnet `chainId`, then load your private key. The client uses the key for all subsequent `submitTx` calls:
+
+```typescript
+import { ExchangeClient } from "@proof/trading-sdk";
+
+const client = new ExchangeClient({ chainId: "exchange-devnet-1" });
+client.setPrivateKey(privateKey);
+```
+
+All three URL options (`rpcUrl`, `apiUrl`, `gatewayUrl`) default to `https://api.dev.proof.trade`, so no additional config is required for devnet.
+
+### Query the orderbook
+
+Before trading, verify connectivity and check the current book for market 1 (BTC perpetual):
+
+```typescript
+const book = await client.queryOrderbook(1);
+// {
+//   bids: [{ price: bigint, totalQty: bigint, orderCount: number }, ...],
+//   asks: [...]
+// }
+
+if (book.bids.length > 0) {
+  const best = book.bids[0];
+  console.log(`Best bid: $${best.price}  qty=${best.totalQty}  orders=${best.orderCount}`);
+}
+```
+
+You can also verify your account balance after the faucet drip:
+
+```typescript
+const account = await client.queryAccount(addressHex);
+// { balance: bigint, equity: bigint, totalMm: bigint, totalIm: bigint, positions: [...] }
+console.log(`Balance: ${account?.balance} µUSDC`);
+```
+
+### Place a limit order
+
+Submit a limit buy order on market 1. Prices are **integer cents** (`bigint`) — $50,000.00 is `5000000n`:
+
+```typescript
+import { Side } from "@proof/trading-sdk";
+
+const result = await client.submitTx({
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: address,        // 20-byte Uint8Array from pubkeyToOwner()
+    side: Side.Buy,
+    price: 5000000n,       // $50,000.00 in integer cents
+    quantity: 1n,          // 1 contract
+  },
+});
+
+console.log(result);
+// { code: 0, hash: "ABC123...", log: "" }
+```
+
+To wait for block inclusion rather than just CheckTx, use `submitTxCommit` instead:
+
+```typescript
+const result = await client.submitTxCommit({
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: address,
+    side: Side.Buy,
+    price: 5000000n,
+    quantity: 1n,
+  },
+});
+// result.height is set once the tx lands in a block
+console.log(`Confirmed at block ${result.height}`);
+```
+
+### Check the result code
+
+Every `submitTx` and `submitTxCommit` call returns a `TxResult`. Always check `code` before assuming success:
+
+```typescript
+if (result.code !== 0) {
+  console.error(`Order failed: code=${result.code}  log=${result.log}`);
+}
+```
+
+<Note>
+  `code: 0` means CheckTx passed — the gateway accepted the transaction and it was broadcast to CometBFT. A non-zero code on `submitTx` means the transaction was rejected before entering the mempool. With `submitTxCommit`, a non-zero code at `height` means the engine rejected the action at DeliverTx (block inclusion), even after CheckTx passed.
+</Note>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Full working example
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+The complete generate → fund → query → trade flow, taken directly from the SDK's agent quickstart:
+
+```typescript
+import {
+  ExchangeClient,
+  Side,
+  Action,
+  TxResult,
+  generateKeypair,
+  pubkeyToOwner,
+  ownerToHex,
+} from "@proof/trading-sdk";
+
+// 1. Key
+const { publicKey, privateKey } = generateKeypair();
+const address = pubkeyToOwner(publicKey);
+
+// 2. Client
+const client = new ExchangeClient({ chainId: "exchange-devnet-1" });
+client.setPrivateKey(privateKey);
+
+// 3. Query
+const book = await client.queryOrderbook(1);
+const acct = await client.queryAccount();
+
+// 4. Trade
+const r: TxResult = await client.submitTx({
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: address,
+    side: Side.Buy,
+    price: 50000000n,
+    quantity: 1n,
+  },
+});
+```
+
+You can run the SDK's end-to-end example directly without any setup:
+
+```bash
+PROOF_FAUCET_TOKEN=<token> npx tsx examples/connect-and-trade.ts
+```
+
+## Common error codes
+
+When `result.code` is non-zero, consult the table below. The `result.log` field usually contains a human-readable explanation alongside the code.
+
+| Code  | Name                     | What it means and how to handle it                                              |
+| ----- | ------------------------ | -------------------------------------------------------------------------------- |
+| `0`   | Success                  | CheckTx passed. Transaction was accepted.                                        |
+| `12`  | InsufficientMargin       | Not enough free margin. Check `account.equity` and reduce order size.           |
+| `17`  | InvalidSignature         | The signature is malformed. Verify `chainId` matches the target network.         |
+| `21`  | TimestampNonceRejected   | Nonce was outside the sliding window or was a replay. Retry — the SDK auto-advances. |
+| `34`  | PostOnlyWouldCross       | A `postOnly: true` order would have matched immediately. Adjust the price.       |
+| `401` | MissingApiKey            | Gateway requires an `apiKey` in `ExchangeClientOptions`.                         |
+| `429` | RateLimited              | Too many requests. Back off and retry.                                           |
+
+### Error handling pattern
+
+```typescript
+const r = await client.submitTx({ type: "PlaceOrder", data: { /* ... */ } });
+
+if (r.code !== 0) {
+  if (r.code === 21) {
+    // Timestamp nonce collision — just retry (SDK auto-advances the nonce)
+    return await client.submitTx({ type: "PlaceOrder", data: { /* ... */ } });
+  }
+  if (r.code === 12) {
+    console.log("Insufficient margin — check account balance");
+  }
+  throw new Error(`Order failed: code=${r.code} log=${r.log}`);
+}
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    TypeScript, Python, and Rust setup guides with runtime requirements.
+  </Card>
+  <Card title="Key Management" icon="key" href="/concepts/key-management">
+    Secure key generation, storage patterns, and address derivation details.
+  </Card>
+  <Card title="Placing Orders" icon="arrow-right-arrow-left" href="/guides/placing-orders">
+    Full guide to limit orders, market orders, cancel-replace, and basket orders.
+  </Card>
+  <Card title="Account Queries" icon="magnifying-glass" href="/guides/account-queries">
+    Query balances, positions, open orders, history, and margin ratios.
+  </Card>
+</CardGroup>

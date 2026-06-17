@@ -1,0 +1,331 @@
+---
+title: "Monitoring and Closing Perpetual Positions"
+sidebarTitle: "Positions"
+description: "Query open positions, check margin health, handle funding payments, monitor ADL risk, and close perpetuals cleanly with the Proof Trading SDK."
+---
+
+A **position** on the Proof Exchange is a perpetual contract held by an account on one side of a market. Positions are opened by fills, reduced by opposing fills, and tracked by the engine in real time. This guide explains how to read position state, interpret margin and funding metrics, close positions safely, and understand the liquidation and auto-deleveraging waterfalls.
+
+---
+
+## What is a Position?
+
+Every open position is represented by a `PositionInfo` struct returned inside `AccountInfo.positions`. The core fields mirror the engine's on-chain state; additional computed fields are enriched by the gateway at query time.
+
+| Field | Index | Type | Description |
+|---|---|---|---|
+| `owner` | 0 | `Uint8Array` | 20-byte account address |
+| `market` | 1 | `number` | Market identifier |
+| `side` | 2 | `"Buy"` / `"Sell"` | `"Buy"` = long, `"Sell"` = short |
+| `entryPrice` | 3 | `bigint` | Weighted-average entry price in cents (2 dp) |
+| `size` | 4 | `bigint` | Absolute size in contracts (integer lots) |
+| `lastFundingIndex` | 5 | `bigint` | Cumulative funding index at last settlement |
+| `upnlNow` | 6 | `bigint?` | Unrealized PnL at the current mark price |
+| `mmNow` | 7 | `bigint?` | Maintenance margin contribution for this position |
+| `imNow` | 8 | `bigint?` | Initial margin contribution for this position |
+| `pnlIfFires` | 9 | `bigint?` | Position value if its branch resolves to YES (perps always fire) |
+| `pnlIfDies` | 10 | `bigint?` | Position value if its branch resolves to NO |
+| `fundingSince` | 11 | `bigint?` | Funding accrued since last settlement (positive = credit, negative = debit) |
+| `adlScore` | 12 | `bigint?` | ADL queue score — higher = closer to front of queue |
+
+<Note>
+  Enrichment fields (indices 6–12) are computed by the gateway and absent on responses from older nodes. Always guard for `undefined` before using them.
+</Note>
+
+---
+
+## Querying Positions
+
+Positions are returned inside `AccountInfo` from `client.queryAccount()`. You can pass an address hex string, or omit it to query the connected wallet.
+
+```typescript
+import { ExchangeClient, generateKeypair, pubkeyToOwner, ownerToHex } from "@proof/trading-sdk";
+
+const { publicKey, privateKey } = generateKeypair();
+const address = pubkeyToOwner(publicKey);
+const addressHex = ownerToHex(address);
+
+const client = new ExchangeClient({ chainId: "exchange-devnet-1" });
+client.setPrivateKey(privateKey);
+
+const account = await client.queryAccount(addressHex);
+if (!account) {
+  console.log("No account found");
+  process.exit(0);
+}
+
+console.log("Positions:", account.positions.length);
+for (const pos of account.positions) {
+  console.log({
+    market: pos.market,
+    side: pos.side,            // "Buy" or "Sell"
+    size: pos.size,            // bigint contracts
+    entryPrice: pos.entryPrice, // bigint cents
+    upnlNow: pos.upnlNow,     // bigint microUSDC (undefined on old nodes)
+  });
+}
+```
+
+---
+
+## AccountInfo: Full Margin State
+
+`queryAccount()` returns an `AccountInfo` object that includes the account's full margin picture alongside its positions.
+
+```typescript
+interface AccountInfo {
+  balance: bigint;          // Available USDC in microUSDC
+  positions: PositionInfo[]; // All open positions
+  equity: bigint;           // balance + unrealized PnL (scenario-aware)
+  totalMm: bigint;          // Total maintenance margin requirement in microUSDC
+  totalIm: bigint;          // Total initial margin requirement in microUSDC
+  marginRatioBps: bigint;   // equity / total notional * 10000 (basis points)
+  bindingScenario?: BindingScenarioEntry[]; // Worst-case resolution scenario (impact markets)
+  feesAccrued?: bigint;     // Cumulative fees paid or rebates received in microUSDC
+  volume30dMicroUsdc?: bigint; // Rolling 30-day taker volume for fee tiers
+}
+```
+
+### Checking Margin Health
+
+```typescript
+const account = await client.queryAccount();
+if (!account) throw new Error("Account not found");
+
+const { equity, totalMm, totalIm, marginRatioBps, balance } = account;
+
+// Convert from microUSDC (6 dp) to dollars for display
+const toUsd = (n: bigint) => Number(n) / 1_000_000;
+
+console.log(`Balance:       $${toUsd(balance).toFixed(2)}`);
+console.log(`Equity:        $${toUsd(equity).toFixed(2)}`);
+console.log(`Total MM:      $${toUsd(totalMm).toFixed(2)}`);
+console.log(`Total IM:      $${toUsd(totalIm).toFixed(2)}`);
+console.log(`Margin ratio:  ${marginRatioBps}bps`);
+
+// Warn when equity is within 20% of the maintenance margin threshold
+if (equity < totalMm * 120n / 100n) {
+  console.warn("⚠ Margin health low — consider reducing position size");
+}
+
+// Liquidation occurs when equity < totalMm
+if (equity < totalMm) {
+  console.error("✖ Account is under maintenance margin — liquidation risk");
+}
+```
+
+---
+
+## Closing a Position
+
+### ClosePosition Action
+
+`ClosePosition` is the simplest way to exit an entire position. The engine places an opposite-side IOC order at `oracle ± spread` and settles the resulting PnL instantly. It is **idempotent**: if no position exists, the engine returns code 0 with no events.
+
+```typescript
+// Close the entire position on market 1
+const result = await client.submitTxCommit({
+  type: "ClosePosition",
+  data: {
+    market: 1,
+    owner: address,
+  },
+});
+
+if (result.code === 0) {
+  console.log("Position closed at block", result.height);
+} else {
+  console.error("Close failed:", result.log);
+}
+```
+
+<Tip>
+  Use `submitTxCommit` when closing positions — it polls for block inclusion and confirms the realized PnL before your code continues.
+</Tip>
+
+### Close Multiple Positions
+
+```typescript
+const account = await client.queryAccount();
+if (!account) throw new Error("No account");
+
+for (const pos of account.positions) {
+  const r = await client.submitTxCommit({
+    type: "ClosePosition",
+    data: { market: pos.market, owner: address },
+  });
+  console.log(`Market ${pos.market}: code=${r.code}`);
+}
+```
+
+---
+
+## Setting Per-Market Leverage
+
+`SetUserMarketLeverage` lets an account override the initial margin requirement on a specific market, effectively changing the maximum leverage. The engine enforces `max(market.imBps, userImBps)`, so users can only **deleverage** — not exceed the market's risk floor.
+
+Set `userImBps` to `0` to clear the override and revert to the market default.
+
+```typescript
+// Set a custom 20% initial margin (5x leverage) on market 1
+// Market default might be 10% (10x). This is more conservative.
+await client.submitTx({
+  type: "SetUserMarketLeverage",
+  data: {
+    owner: address,
+    market: 1,
+    userImBps: 2000, // 2000 bps = 20% IM → 5x max leverage
+  },
+});
+
+// Clear the override — revert to market default
+await client.submitTx({
+  type: "SetUserMarketLeverage",
+  data: {
+    owner: address,
+    market: 1,
+    userImBps: 0,
+  },
+});
+```
+
+<Warning>
+  `userImBps` must be greater than or equal to `market.imBps`. Attempting to set a lower value is rejected by the engine with code 38 (`UserLeverageBelowMarketIm`).
+</Warning>
+
+---
+
+## Funding Payments
+
+Perpetual markets use periodic funding payments to keep the perpetual price anchored to the oracle price. Funding is applied at each `fundingIntervalMs` tick defined in `MarketConfig`.
+
+### How Funding Works
+
+1. The engine computes a funding rate (`fundingRateBps`) based on the spread between the mark price and the oracle.
+2. A `FundingApplied` event is emitted for the market, incrementing the cumulative funding index.
+3. For each position, the engine computes the payment as:
+   ```
+   fundingSince = -sign(side) × (cumulativeFunding − lastFundingIndex) × size / FUNDING_SCALE
+   ```
+4. A `FundingSettled` event is emitted per position with the signed `payment` in microUSDC.
+
+### Reading Accrued Funding
+
+The `fundingSince` enrichment field on `PositionInfo` gives the funding accrued since the position's last settlement — positive means credit to the account, negative means debit.
+
+```typescript
+const account = await client.queryAccount();
+for (const pos of account!.positions) {
+  const funding = pos.fundingSince ?? 0n;
+  const fundingUsd = Number(funding) / 1_000_000;
+  const sign = funding >= 0n ? "+" : "";
+  console.log(`Market ${pos.market} ${pos.side}: funding ${sign}$${fundingUsd.toFixed(4)}`);
+}
+```
+
+---
+
+## Auto-Deleveraging (ADL)
+
+When a liquidation generates bad debt that exhausts the insurance pool, the engine uses Auto-Deleveraging (ADL) to force-close profitable positions at the bankruptcy price. This is the last resort in the bad-debt waterfall — after partial liquidation and the insurance fund.
+
+### ADL Queue
+
+The `adlScore` on `PositionInfo` represents priority in the ADL queue:
+- **Higher score = closer to the front** = more likely to be ADL'd if bad debt occurs.
+- Formula: `max(0, upnlNow) × leverage_used` — only profitable positions have a non-zero score.
+- Losing positions are liquidated, not ADL'd.
+
+```typescript
+// Query the full ADL queue for market 1 (sorted by adlScore desc)
+const queue = await client.queryAdlQueue(1);
+
+for (let i = 0; i < queue.length; i++) {
+  const entry = queue[i];
+  const percentile = Math.round(((queue.length - i) / queue.length) * 100);
+  console.log({
+    rank: i + 1,
+    percentile: `${percentile}th percentile`,
+    side: entry.side,
+    size: entry.size,
+    upnlNow: entry.upnlNow,
+    adlScore: entry.adlScore,
+  });
+}
+```
+
+```typescript
+// Find your own position's ADL rank
+const myHex = client.getAddressHex()!;
+const myEntry = queue.findIndex((e) => {
+  const entryHex = Buffer.from(e.owner).toString("hex");
+  return entryHex === myHex;
+});
+
+if (myEntry !== -1) {
+  const percentile = Math.round(((queue.length - myEntry) / queue.length) * 100);
+  if (percentile > 90) {
+    console.warn(`⚠ Your position is in the top ${100 - percentile}% ADL risk`);
+  }
+}
+```
+
+<Warning>
+  A position above the 90th percentile ADL rank is at elevated risk of being automatically deleveraged during a liquidation cascade. Consider reducing size or taking partial profits.
+</Warning>
+
+---
+
+## Liquidation
+
+An account is liquidated when its equity falls below `totalMm`. The engine emits an `AccountLiquidated` event for each market where a position is closed.
+
+```typescript
+interface AccountLiquidatedEvent {
+  type: "AccountLiquidated";
+  owner: string;      // hex-encoded account address
+  market: string;     // market ID (stringified number)
+  side: string;       // "Buy" or "Sell"
+  size: string;       // size at liquidation (stringified bigint)
+  markPrice: string;  // mark price at liquidation in cents (2 dp)
+  realizedPnl: string; // signed realized PnL in microUSDC
+}
+```
+
+Listen for this event via `subscribeBlocks` to build a liquidation alert:
+
+```typescript
+const unsub = client.subscribeBlocks((event) => {
+  if (event.type === "AccountLiquidated") {
+    const myHex = client.getAddressHex()!;
+    if (event.owner === myHex) {
+      console.error("Your account was liquidated:", event);
+    }
+  }
+});
+```
+
+---
+
+## Position History
+
+`queryHistoryPositions()` returns point-in-time snapshots of a position after each fill. A row with `size === "0"` represents a close event.
+
+```typescript
+const snapshots = await client.queryHistoryPositions(addressHex, {
+  market: 1,             // optional: scope to one market
+  fromMs: Date.now() - 7 * 24 * 60 * 60 * 1000, // last 7 days
+  limit: 100,
+});
+
+for (const snap of snapshots) {
+  console.log({
+    market: snap.market,
+    side: snap.side,
+    entryPrice: snap.entryPrice,  // weighted avg entry at this snapshot
+    size: snap.size,              // "0" = position closed
+    blockHeight: snap.blockHeight,
+    timestamp: new Date(snap.timestamp).toISOString(),
+  });
+}
+```

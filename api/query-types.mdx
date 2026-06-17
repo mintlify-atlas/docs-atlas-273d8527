@@ -1,0 +1,778 @@
+---
+title: "Query Response Types: Accounts, Orders, and Markets"
+sidebarTitle: "Query Types"
+description: "Reference for all TypeScript query response types returned by the Proof Trading SDK, including orderbook, account, position, market config, and history shapes."
+---
+
+The Proof Trading SDK exposes a set of strongly-typed query response interfaces that mirror the engine's MessagePack wire format. Every type documented here is defined in `src/types.ts` and is returned directly by client query methods such as `queryOrderbook`, `queryAccount`, and `queryMarketConfig`. Numeric values carried as `bigint` preserve full precision for on-chain integers (prices in cents, balances in microUSDC, contract quantities); fields marked `number` are safely bounded integers such as market IDs and basis-point rates.
+
+---
+
+## Orderbook
+
+Aggregated order book snapshot for a market. Returned by `client.queryOrderbook(marketId)`.
+
+```typescript
+interface Orderbook {
+  bids: OrderbookLevel[];
+  asks: OrderbookLevel[];
+}
+```
+
+<ResponseField name="bids" type="OrderbookLevel[]" required>
+  Bid (buy) levels, sorted best (highest price) first.
+</ResponseField>
+
+<ResponseField name="asks" type="OrderbookLevel[]" required>
+  Ask (sell) levels, sorted best (lowest price) first.
+</ResponseField>
+
+---
+
+## OrderbookLevel
+
+A single aggregated price level in the order book.
+
+```typescript
+interface OrderbookLevel {
+  price: bigint;
+  totalQty: bigint;
+  orderCount: number;
+}
+```
+
+<ResponseField name="price" type="bigint" required>
+  Price in cents with 2 decimal places (e.g., `6675234n` = $66,752.34).
+</ResponseField>
+
+<ResponseField name="totalQty" type="bigint" required>
+  Total resting quantity at this level in integer contracts (lots).
+</ResponseField>
+
+<ResponseField name="orderCount" type="number" required>
+  Number of individual resting orders at this level.
+</ResponseField>
+
+---
+
+## OpenOrder
+
+A single resting order on the book. Returned by `client.queryOpenOrders(address)`. Wire shape is a 6-tuple `[id, market, owner, side, price, quantity]`.
+
+```typescript
+interface OpenOrder {
+  id: bigint;
+  market: number;
+  owner: Uint8Array;
+  side: "Buy" | "Sell";
+  price: bigint;
+  quantity: bigint;
+}
+```
+
+<ResponseField name="id" type="bigint" required>
+  Engine-assigned order ID. Monotonically increasing within a market.
+</ResponseField>
+
+<ResponseField name="market" type="number" required>
+  Market identifier.
+</ResponseField>
+
+<ResponseField name="owner" type="Uint8Array" required>
+  20-byte owner address derived from the Ed25519 public key.
+</ResponseField>
+
+<ResponseField name="side" type='"Buy" | "Sell"' required>
+  Order side: `"Buy"` for long, `"Sell"` for short.
+</ResponseField>
+
+<ResponseField name="price" type="bigint" required>
+  Limit price in cents (2 decimal places).
+</ResponseField>
+
+<ResponseField name="quantity" type="bigint" required>
+  Resting quantity in integer contracts.
+</ResponseField>
+
+---
+
+## AccountInfo
+
+Full account snapshot including balance, open positions, and margin state. Returned by `client.queryAccount(address)`. Wire shape is a positional MessagePack array; index numbers are stable for backward compatibility.
+
+```typescript
+interface AccountInfo {
+  balance: bigint;                          // [0]
+  positions: PositionInfo[];                // [1]
+  equity: bigint;                           // [2]
+  totalMm: bigint;                          // [3]
+  totalIm: bigint;                          // [4]
+  marginRatioBps: bigint;                   // [5]
+  bindingScenario?: BindingScenarioEntry[]; // [6]
+  feesAccrued?: bigint;                     // [7]
+  volume30dMicroUsdc?: bigint;              // [8]
+}
+```
+
+<ResponseField name="balance" type="bigint" required>
+  `[0]` Available USDC balance in microUSDC (6 decimal places). Example: `100_000_000_000n` = $100,000.
+</ResponseField>
+
+<ResponseField name="positions" type="PositionInfo[]" required>
+  `[1]` All open positions for this account. See [PositionInfo](#positioninfo) below.
+</ResponseField>
+
+<ResponseField name="equity" type="bigint" required>
+  `[2]` Total equity in microUSDC (balance + unrealized PnL). Scenario-aware: returns the worst-case equity across all active impact-market resolution outcomes.
+</ResponseField>
+
+<ResponseField name="totalMm" type="bigint" required>
+  `[3]` Total maintenance margin requirement in microUSDC. Scenario-aware: returns the maximum MM across all resolution outcomes.
+</ResponseField>
+
+<ResponseField name="totalIm" type="bigint" required>
+  `[4]` Total initial margin requirement in microUSDC.
+</ResponseField>
+
+<ResponseField name="marginRatioBps" type="bigint" required>
+  `[5]` Current margin ratio in basis points (`equity / total notional × 10,000`).
+</ResponseField>
+
+<ResponseField name="bindingScenario" type="BindingScenarioEntry[]">
+  `[6]` The resolution scenario that maximises `totalMm` — one entry per active impact market, ascending by `impactMarketId`. Empty for perp-only accounts. Absent on responses from gateways older than 2026-04-24.
+
+  <Expandable title="BindingScenarioEntry fields">
+    <ResponseField name="impactMarketId" type="number" required>
+      The impact-market family identifier.
+    </ResponseField>
+    <ResponseField name="branch" type='"Yes" | "No"' required>
+      The resolution branch (outcome) for this impact market in the binding scenario.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="feesAccrued" type="bigint">
+  `[7]` Cumulative trading fees paid (positive) or rebates received (negative) in microUSDC. Updated atomically at fill time. New accounts read `0n`. Absent on gateways predating 2026-05-03.
+</ResponseField>
+
+<ResponseField name="volume30dMicroUsdc" type="bigint">
+  `[8]` Rolling 30-day taker volume in microUSDC at the account's last volume update. Used by the engine to select the applicable fee tier before the next fill. Absent on older gateways.
+</ResponseField>
+
+---
+
+## PositionInfo
+
+Information about a single open position. Fields `[0]–[5]` are raw engine state; fields `[6]–[12]` are response-only enrichments computed at query time. Indices are stable with the msgpack wire tuple.
+
+```typescript
+interface PositionInfo {
+  owner: Uint8Array;           // [0]
+  market: number;              // [1]
+  side: "Buy" | "Sell";        // [2]
+  entryPrice: bigint;          // [3]
+  size: bigint;                // [4]
+  lastFundingIndex: bigint;    // [5]
+  upnlNow?: bigint;            // [6]
+  mmNow?: bigint;              // [7]
+  imNow?: bigint;              // [8]
+  pnlIfFires?: bigint;         // [9]
+  pnlIfDies?: bigint;          // [10]
+  fundingSince?: bigint;       // [11]
+  adlScore?: bigint;           // [12]
+}
+```
+
+<ResponseField name="owner" type="Uint8Array" required>
+  `[0]` 20-byte owner address.
+</ResponseField>
+
+<ResponseField name="market" type="number" required>
+  `[1]` Market identifier.
+</ResponseField>
+
+<ResponseField name="side" type='"Buy" | "Sell"' required>
+  `[2]` Position side: `"Buy"` = long, `"Sell"` = short.
+</ResponseField>
+
+<ResponseField name="entryPrice" type="bigint" required>
+  `[3]` Weighted-average entry price in cents (2 decimal places).
+</ResponseField>
+
+<ResponseField name="size" type="bigint" required>
+  `[4]` Absolute position size in integer contracts.
+</ResponseField>
+
+<ResponseField name="lastFundingIndex" type="bigint" required>
+  `[5]` Cumulative funding index at the time the position was last settled.
+</ResponseField>
+
+<ResponseField name="upnlNow" type="bigint">
+  `[6]` Unrealized P&L at the current mark price (signed), unconditional. Perp and CP positions use the oracle as the current mark; binary positions return `0` — use `pnlIfFires`/`pnlIfDies` instead.
+</ResponseField>
+
+<ResponseField name="mmNow" type="bigint">
+  `[7]` Maintenance margin contribution of this position when its firing branch is active. Zero under the non-firing branch for CP/binary positions.
+</ResponseField>
+
+<ResponseField name="imNow" type="bigint">
+  `[8]` Initial margin contribution. Same firing-branch semantics as `mmNow`.
+</ResponseField>
+
+<ResponseField name="pnlIfFires" type="bigint">
+  `[9]` Position value if its branch fires (μ = 1): `sign(side) × (settle × size − entry × size)`. Perpetuals always fire; CP fires when the event resolves to its branch; binary fires and settles to `BINARY_PRICE_MAX × size`.
+</ResponseField>
+
+<ResponseField name="pnlIfDies" type="bigint">
+  `[10]` Position value if its branch does NOT fire (μ = 0): `sign(side) × (0 − entry × size)`. For perpetuals this equals `upnlNow` (perps never die, reported for UI column symmetry).
+</ResponseField>
+
+<ResponseField name="fundingSince" type="bigint">
+  `[11]` Funding accrued since the position's last settled funding index, in microUSDC. Positive = credit received, negative = debit paid.
+</ResponseField>
+
+<ResponseField name="adlScore" type="bigint">
+  `[12]` Auto-deleveraging queue score: `max(0, upnlNow) × leverage_used`. Higher values are closer to the front of the ADL queue. Only profitable positions have a non-zero score. UIs should rank positions by `adlScore` descending to compute a per-market percentile and warn above the 90th percentile.
+</ResponseField>
+
+---
+
+## AdlQueueEntry
+
+One row of the auto-deleveraging queue for a market. Returned by `GET /v1/adl/queue/{market}`, sorted by `adlScore` descending (front of queue first). Wire shape is a 6-tuple `[owner, market, side, size, upnlNow, adlScore]`.
+
+```typescript
+interface AdlQueueEntry {
+  owner: Uint8Array;
+  market: number;
+  side: "Buy" | "Sell";
+  size: bigint;
+  upnlNow: bigint;
+  adlScore: bigint;
+}
+```
+
+<ResponseField name="owner" type="Uint8Array" required>
+  20-byte owner address.
+</ResponseField>
+
+<ResponseField name="market" type="number" required>
+  Market identifier.
+</ResponseField>
+
+<ResponseField name="side" type='"Buy" | "Sell"' required>
+  Position side: `"Buy"` = long, `"Sell"` = short.
+</ResponseField>
+
+<ResponseField name="size" type="bigint" required>
+  Position size in integer contracts.
+</ResponseField>
+
+<ResponseField name="upnlNow" type="bigint" required>
+  Unrealized PnL at the current mark price (signed). Always positive in this queue — only profitable positions are eligible for ADL.
+</ResponseField>
+
+<ResponseField name="adlScore" type="bigint" required>
+  `max(0, upnlNow) × leverage_bps`. Higher = closer to the front of the queue. Tied with `PositionInfo.adlScore` for the same position.
+</ResponseField>
+
+---
+
+## Ticker
+
+One-round-trip market summary for the markets-page card rail and the perp trade ticker bar. Returned by `client.queryTicker(marketId)`.
+
+```typescript
+interface Ticker {
+  market: string;
+  lastPrice: string;
+  volume24hContracts: string;
+  change24hBps: string;
+  fundingMsgpackB64: string;
+  orderbookMsgpackB64: string;
+  openInterest: string | null;
+}
+```
+
+<ResponseField name="market" type="string" required>
+  Market ID as a decimal string.
+</ResponseField>
+
+<ResponseField name="lastPrice" type="string" required>
+  Last fill price within the 24-hour window. `"0"` or empty if no trades have occurred.
+</ResponseField>
+
+<ResponseField name="volume24hContracts" type="string" required>
+  Sum of contract quantities filled in the 24-hour window (integer contracts).
+</ResponseField>
+
+<ResponseField name="change24hBps" type="string" required>
+  Signed 24-hour price change in basis points. `"0"` or empty if no trades have occurred.
+</ResponseField>
+
+<ResponseField name="fundingMsgpackB64" type="string" required>
+  Base64-encoded msgpack blob containing the `FundingInfo` struct (mark EWMA, oracle price, funding rate, and interval). Decode with `@msgpack/msgpack`.
+</ResponseField>
+
+<ResponseField name="orderbookMsgpackB64" type="string" required>
+  Base64-encoded msgpack blob containing an `OrderbookSnapshot` at depth 1. Empty string for fresh markets with no resting orders.
+</ResponseField>
+
+<ResponseField name="openInterest" type="string | null" required>
+  Always `null` today — the engine does not yet track open interest. UIs should render `"—"` or `"coming soon"` for this column.
+</ResponseField>
+
+---
+
+## MarketConfig
+
+Full configuration for a perpetual, conditional, or binary market. The wire form is a positional MessagePack array; indices mirror the Rust struct field order. Fields after index 7 use `serde(default)` so older on-chain records decode cleanly.
+
+```typescript
+interface MarketConfig {
+  market: number;                       // [0]
+  imBps: number;                        // [1]
+  mmBps: number;                        // [2]
+  takerFeeBps: number;                  // [3]
+  makerFeeBps: number;                  // [4]
+  fundingIntervalMs: bigint;            // [5]
+  maxFundingRateBps: number;            // [6]
+  kind?: MarketKind;                    // [7]
+  maxPositionSize?: bigint;             // [8]
+  defaultTtlMs?: bigint;                // [9]
+  netDeltaMargin?: boolean;             // [10]
+  poolId?: number;                      // [11]
+  markPriceMaxOracleAgeMs?: bigint;     // [12]
+  feeTiers?: FeeTier[];                 // [13]
+  tickSize?: bigint;                    // [14]
+  lotSize?: bigint;                     // [15]
+  primaryOracleSigner?: Address;        // [16]
+  oracleStalenessMs?: bigint;           // [17]
+  markSourceMode?: MarkSourceMode;      // [18]
+  maxMarkSpreadBps?: number;            // [19]
+  cexCompositeStalenessMs?: bigint;     // [20]
+  partialLiquidationEnabled?: boolean;  // [21]
+  szDecimals?: number;                  // [22]
+  ticker?: string;                      // [23]
+}
+```
+
+<ResponseField name="market" type="number" required>
+  `[0]` Market identifier (unique integer).
+</ResponseField>
+
+<ResponseField name="imBps" type="number" required>
+  `[1]` Initial margin requirement in basis points (e.g., `1000` = 10% = 10× max leverage).
+</ResponseField>
+
+<ResponseField name="mmBps" type="number" required>
+  `[2]` Maintenance margin requirement in basis points (e.g., `500` = 5%).
+</ResponseField>
+
+<ResponseField name="takerFeeBps" type="number" required>
+  `[3]` Taker fee rate in basis points (e.g., `5` = 0.05%).
+</ResponseField>
+
+<ResponseField name="makerFeeBps" type="number" required>
+  `[4]` Maker fee rate in basis points (e.g., `2` = 0.02%).
+</ResponseField>
+
+<ResponseField name="fundingIntervalMs" type="bigint" required>
+  `[5]` Funding payment interval in milliseconds. `0` = funding is disabled.
+</ResponseField>
+
+<ResponseField name="maxFundingRateBps" type="number" required>
+  `[6]` Maximum absolute funding rate per interval in basis points.
+</ResponseField>
+
+<ResponseField name="kind" type="MarketKind">
+  `[7]` Market kind discriminator. Defaults to `"Perp"` for legacy records. Parameterised variants are `{ ConditionalPerp: [impactId, "Yes" | "No"] }` and `{ PredictionBinary: [impactId, "Yes" | "No"] }`.
+</ResponseField>
+
+<ResponseField name="maxPositionSize" type="bigint">
+  `[8]` Per-account absolute position cap in integer contracts. `0` = no limit.
+</ResponseField>
+
+<ResponseField name="defaultTtlMs" type="bigint">
+  `[9]` Default order TTL in milliseconds. `0` = no automatic expiry. When set, resting orders older than this value are swept at the end of each block.
+</ResponseField>
+
+<ResponseField name="netDeltaMargin" type="boolean">
+  `[10]` When `true`, firing legs sharing the same underlying are netted into a single position for MM/IM calculations (`|Σ signed_size| × settle × weighted_bps`). When `false`, per-leg scenario margin applies.
+</ResponseField>
+
+<ResponseField name="poolId" type="number">
+  `[11]` Insurance-fund pool ID. Markets in different pools are insulated from each other's liquidation cascades. `0` = shared default pool.
+</ResponseField>
+
+<ResponseField name="markPriceMaxOracleAgeMs" type="bigint">
+  `[12]` Maximum oracle age in milliseconds before the engine refuses to use the oracle price for mark calculations. `0` = no staleness check.
+</ResponseField>
+
+<ResponseField name="feeTiers" type="FeeTier[]">
+  `[13]` Volume-based fee tier table. Empty array = flat taker/maker fees apply.
+
+  <Expandable title="FeeTier fields">
+    <ResponseField name="min30dVolumeMicroUsdc" type="bigint" required>
+      `[0]` Minimum 30-day rolling taker volume in microUSDC to qualify for this tier.
+    </ResponseField>
+    <ResponseField name="makerFeeTenthBps" type="number" required>
+      `[1]` Maker fee in tenth-basis-points. Negative values are maker rebates.
+    </ResponseField>
+    <ResponseField name="takerFeeTenthBps" type="number" required>
+      `[2]` Taker fee in tenth-basis-points.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="tickSize" type="bigint">
+  `[14]` Minimum price increment in microUSDC. `0` = no tick gate (any price accepted).
+</ResponseField>
+
+<ResponseField name="lotSize" type="bigint">
+  `[15]` Minimum quantity increment in integer contracts. `0` = no lot gate (any quantity accepted).
+</ResponseField>
+
+<ResponseField name="primaryOracleSigner" type="Address">
+  `[16]` 20-byte primary oracle signer address. When set, oracle updates from this signer take precedence. Pass an all-zero address to clear.
+</ResponseField>
+
+<ResponseField name="oracleStalenessMs" type="bigint">
+  `[17]` Oracle staleness threshold in milliseconds. Only consulted when `primaryOracleSigner` is set. `0` = gate disabled.
+</ResponseField>
+
+<ResponseField name="markSourceMode" type='"OracleOnly" | "Median"'>
+  `[18]` Mark-price source mode. `"OracleOnly"` = legacy oracle-only mode; `"Median"` = median of oracle and book-mid. Has no effect on impact-family child markets.
+</ResponseField>
+
+<ResponseField name="maxMarkSpreadBps" type="number">
+  `[19]` Thin-book spread cap in basis points for the `"Median"` mark-price guard. `0` resets to the engine default (100 bps). Ignored unless `markSourceMode === "Median"`.
+</ResponseField>
+
+<ResponseField name="cexCompositeStalenessMs" type="bigint">
+  `[20]` Maximum age in milliseconds for the composite-CEX price source in `"Median"` mode. `0` resets to the engine default (30 seconds).
+</ResponseField>
+
+<ResponseField name="partialLiquidationEnabled" type="boolean">
+  `[21]` When `true`, liquidation closes one position at a time and rechecks maintenance margin before proceeding. When `false`, all-or-nothing liquidation applies.
+</ResponseField>
+
+<ResponseField name="szDecimals" type="number">
+  `[22]` Published size scale: order and position quantities are in units of `10^-szDecimals` of the base asset (display/metadata only — the engine never reads this field). `0` = integer-unit sizing.
+</ResponseField>
+
+<ResponseField name="ticker" type="string">
+  `[23]` Human-readable ticker symbol (e.g., `"BTC"`). Display/metadata only; capped at 24 bytes. Fixed at market creation and immutable thereafter.
+</ResponseField>
+
+---
+
+## History Types
+
+### HistoryCashFlow
+
+One row of the per-user deposit/withdrawal cash-flow log. Returned by `GET /v1/history/deposits/{address}` and `GET /v1/history/withdrawals/{address}`.
+
+```typescript
+interface HistoryCashFlow {
+  kind: "deposit_confirmed" | "withdraw_requested"
+      | "withdrawal_confirmed" | "withdrawal_failed";
+  owner: string;
+  amount: string;
+  signedDelta: string;
+  newBalance: string;
+  withdrawalId: string;
+  solanaTxSig: string;
+  solanaDestination: string;
+  reason: string;
+  blockHeight: number;
+  timestamp: number;
+}
+```
+
+<ResponseField name="kind" type="string" required>
+  One of `"deposit_confirmed"`, `"withdraw_requested"`, `"withdrawal_confirmed"`, or `"withdrawal_failed"`.
+</ResponseField>
+
+<ResponseField name="owner" type="string" required>
+  20-byte owner address as a hex string.
+</ResponseField>
+
+<ResponseField name="amount" type="string" required>
+  Amount in microUSDC (always positive). May be empty for `"withdrawal_confirmed"` events.
+</ResponseField>
+
+<ResponseField name="signedDelta" type="string" required>
+  Signed balance change for this event: `+amount` for `deposit_confirmed` and `withdrawal_failed` (credit); `-amount` for `withdraw_requested` (debit); `"0"` for `withdrawal_confirmed` (no balance change on acknowledgement).
+</ResponseField>
+
+<ResponseField name="newBalance" type="string" required>
+  Post-event balance in microUSDC. Empty for `"withdrawal_confirmed"` since no balance change occurs on that event.
+</ResponseField>
+
+<ResponseField name="withdrawalId" type="string" required>
+  Present on withdrawal events (`withdraw_requested`, `withdrawal_confirmed`, `withdrawal_failed`).
+</ResponseField>
+
+<ResponseField name="solanaTxSig" type="string" required>
+  Present on `deposit_confirmed` and `withdrawal_confirmed` events.
+</ResponseField>
+
+<ResponseField name="solanaDestination" type="string" required>
+  Present on `withdraw_requested` events only.
+</ResponseField>
+
+<ResponseField name="reason" type="string" required>
+  Human-readable failure reason. Present on `withdrawal_failed` events only.
+</ResponseField>
+
+<ResponseField name="blockHeight" type="number" required>
+  Block height at which the event landed.
+</ResponseField>
+
+<ResponseField name="timestamp" type="number" required>
+  Unix timestamp in milliseconds.
+</ResponseField>
+
+---
+
+### HistoryResolution
+
+One row of the per-user position-at-resolution log. Returned by `GET /v1/history/resolutions/{address}`.
+
+```typescript
+interface HistoryResolution {
+  kind: "conditional_settled" | "conditional_voided" | "prediction_settled";
+  impactMarketId: string;
+  market: string;
+  owner: string;
+  side: string;
+  size: string;
+  entryPrice: string;
+  settlementPrice: string;
+  realizedPnl: string;
+  blockHeight: number;
+  timestamp: number;
+}
+```
+
+<ResponseField name="kind" type="string" required>
+  One of `"conditional_settled"`, `"conditional_voided"`, or `"prediction_settled"`.
+</ResponseField>
+
+<ResponseField name="impactMarketId" type="string" required>
+  Impact-market family ID that the resolved position belonged to.
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Child market ID (CPY/CPN or EBY/EBN).
+</ResponseField>
+
+<ResponseField name="owner" type="string" required>
+  20-byte owner address as a hex string.
+</ResponseField>
+
+<ResponseField name="side" type="string" required>
+  Position side at resolution: `"Buy"` = long, `"Sell"` = short.
+</ResponseField>
+
+<ResponseField name="size" type="string" required>
+  Position size at resolution in integer contracts (stringified to preserve `BIGINT` precision).
+</ResponseField>
+
+<ResponseField name="entryPrice" type="string" required>
+  Weighted-average entry price of the resolved position.
+</ResponseField>
+
+<ResponseField name="settlementPrice" type="string" required>
+  Settlement price used for PnL calculation. `conditional_settled` → mark price; `prediction_settled` → payoff per share (`BINARY_PRICE_MAX` for winner, `0` for loser); `conditional_voided` → empty string (void path returns margin, no cash movement).
+</ResponseField>
+
+<ResponseField name="realizedPnl" type="string" required>
+  Signed realized PnL in microUSDC. `"0"` for `conditional_voided`.
+</ResponseField>
+
+<ResponseField name="blockHeight" type="number" required>
+  Block height at which the resolution landed.
+</ResponseField>
+
+<ResponseField name="timestamp" type="number" required>
+  Unix timestamp in milliseconds.
+</ResponseField>
+
+---
+
+### HistoryPositionSnapshot
+
+One row of the per-user position-history snapshot log. Each entry is a point-in-time snapshot written after every fill that changes position state (open → grow → reduce → close). A `size` of `"0"` represents a close event. Returned by `GET /v1/history/positions/{address}` with optional `?market=&from=&to=&limit=` filters; results are newest-first.
+
+```typescript
+interface HistoryPositionSnapshot {
+  owner: string;
+  market: string;
+  side: string;
+  entryPrice: string;
+  size: string;
+  blockHeight: number;
+  timestamp: number;
+}
+```
+
+<ResponseField name="owner" type="string" required>
+  20-byte owner address as a hex string.
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Market ID as a decimal string.
+</ResponseField>
+
+<ResponseField name="side" type="string" required>
+  Position side: `"Buy"` = long, `"Sell"` = short.
+</ResponseField>
+
+<ResponseField name="entryPrice" type="string" required>
+  Weighted-average entry price in microUSDC at the time of the snapshot.
+</ResponseField>
+
+<ResponseField name="size" type="string" required>
+  Absolute position size in integer contracts. `"0"` indicates the position was closed at this block.
+</ResponseField>
+
+<ResponseField name="blockHeight" type="number" required>
+  Block height at which the snapshot landed.
+</ResponseField>
+
+<ResponseField name="timestamp" type="number" required>
+  Unix timestamp in milliseconds.
+</ResponseField>
+
+---
+
+## WithdrawalRecord
+
+On-chain withdrawal record returned by `queryWithdrawal`. Mirrors `exchange-core::types::WithdrawalRecord` field-for-field.
+
+```typescript
+type WithdrawalStatus = "Pending" | "Completed" | "Failed";
+
+interface WithdrawalRecord {
+  id: bigint;
+  owner: Address;
+  amount: bigint;
+  solanaDestination: Uint8Array;
+  status: WithdrawalStatus;
+  requestHeight: bigint;
+}
+```
+
+<ResponseField name="id" type="bigint" required>
+  Engine-assigned withdrawal ID.
+</ResponseField>
+
+<ResponseField name="owner" type="Uint8Array" required>
+  20-byte address that requested the withdrawal.
+</ResponseField>
+
+<ResponseField name="amount" type="bigint" required>
+  Withdrawal amount in microUSDC.
+</ResponseField>
+
+<ResponseField name="solanaDestination" type="Uint8Array" required>
+  Solana destination public key (Ed25519, 32 bytes).
+</ResponseField>
+
+<ResponseField name="status" type='"Pending" | "Completed" | "Failed"' required>
+  Lifecycle status. Transitions are one-way: `Pending → Completed` or `Pending → Failed`; never reverses.
+</ResponseField>
+
+<ResponseField name="requestHeight" type="bigint" required>
+  Block height at which the withdrawal request was admitted.
+</ResponseField>
+
+---
+
+## ImpactMarketInfo
+
+On-chain info for an impact-market family (a set of 4–5 related books). Returned by the `impactMarketInfo` query.
+
+```typescript
+type ImpactMarketStatus =
+  | { kind: "Trading" }
+  | { kind: "PreResolution" }
+  | { kind: "Resolved"; outcome: Outcome };
+
+interface ImpactMarketInfo {
+  impactMarketId: number;
+  underlyingMarket: number;
+  cpyMarket: number;
+  cpnMarket: number;
+  ebyMarket: number;
+  ebnMarket: number;
+  question: string;
+  deadlineMs: bigint;
+  resolutionWindowMs: bigint;
+  status: ImpactMarketStatus;
+  createdMs: bigint;
+  resolvedMs: bigint;
+}
+```
+
+<ResponseField name="impactMarketId" type="number" required>
+  Impact-market family identifier.
+</ResponseField>
+
+<ResponseField name="underlyingMarket" type="number" required>
+  The underlying perpetual market this impact market is derived from.
+</ResponseField>
+
+<ResponseField name="cpyMarket" type="number" required>
+  Child market ID for the Conditional Perp Yes (CPY) leg.
+</ResponseField>
+
+<ResponseField name="cpnMarket" type="number" required>
+  Child market ID for the Conditional Perp No (CPN) leg.
+</ResponseField>
+
+<ResponseField name="ebyMarket" type="number" required>
+  Child market ID for the Event Binary Yes (EBY) leg.
+</ResponseField>
+
+<ResponseField name="ebnMarket" type="number" required>
+  Child market ID for the Event Binary No (EBN) leg.
+</ResponseField>
+
+<ResponseField name="question" type="string" required>
+  Human-readable question text for the event (e.g., `"Will BTC exceed $100k by Q4?"`).
+</ResponseField>
+
+<ResponseField name="deadlineMs" type="bigint" required>
+  Unix timestamp in milliseconds at which the event's trading window closes.
+</ResponseField>
+
+<ResponseField name="resolutionWindowMs" type="bigint" required>
+  Duration in milliseconds after `deadlineMs` during which the resolver must submit an outcome.
+</ResponseField>
+
+<ResponseField name="status" type="ImpactMarketStatus" required>
+  Current lifecycle status of the impact market.
+
+  <Expandable title="ImpactMarketStatus variants">
+    <ResponseField name='{ kind: "Trading" }' type="object">
+      The market is live and accepting orders.
+    </ResponseField>
+    <ResponseField name='{ kind: "PreResolution" }' type="object">
+      The deadline has passed; awaiting resolver outcome.
+    </ResponseField>
+    <ResponseField name='{ kind: "Resolved"; outcome: Outcome }' type="object">
+      The event has been resolved. `outcome` is `Yes` (1), `No` (2), or `Void` (3).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="createdMs" type="bigint" required>
+  Unix timestamp in milliseconds at which the impact market was created.
+</ResponseField>
+
+<ResponseField name="resolvedMs" type="bigint" required>
+  Unix timestamp in milliseconds at which the event was resolved. `0` if not yet resolved.
+</ResponseField>

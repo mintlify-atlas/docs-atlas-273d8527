@@ -1,0 +1,294 @@
+---
+title: "ExchangeClientOptions Configuration Reference"
+sidebarTitle: "Client Options"
+description: "Every configuration option for ExchangeClient: endpoints, chain ID resolution, gateway routing, API key auth, and the allowUnbound safety flag."
+---
+
+`ExchangeClientOptions` is the plain object passed to `new ExchangeClient(opts)`. Every field is optional — the defaults point to the public Proof devnet. This page documents each option, its default value, when to override it, and the security implications that apply.
+
+```typescript
+interface ExchangeClientOptions {
+  rpcUrl?:          string;
+  apiUrl?:          string;
+  wsUrl?:           string;
+  chainId?:         string;
+  allowUnbound?:    boolean;
+  gatewayUrl?:      string;
+  useGateway?:      boolean;
+  apiKey?:          string;
+  concurrentNonces?: boolean; // deprecated
+}
+```
+
+---
+
+## Endpoint Options
+
+### `rpcUrl`
+
+<ParamField body="rpcUrl" type="string" optional>
+  CometBFT JSON-RPC endpoint used for `broadcast_tx_sync` (when `useGateway` is `false`), block queries (`/block`, `/block_results`), chain ID resolution (`/status`), transaction polling (`/tx?hash=…`), and WebSocket subscriptions.
+
+  **Default:** `https://api.dev.proof.trade`
+
+  Override this to point at a local devnet node or a private RPC:
+
+  ```typescript
+  const client = new ExchangeClient({
+    rpcUrl: "http://localhost:26657",
+  });
+  ```
+
+  When `rpcUrl` contains port `26657`, the `gatewayUrl` is automatically derived by remapping to port `9080`. See [`gatewayUrl`](#gatewayurl) for details.
+</ParamField>
+
+---
+
+### `apiUrl`
+
+<ParamField body="apiUrl" type="string" optional>
+  Base URL for the Go API server that serves all read endpoints: `/v1/orderbook/{market}`, `/v1/account/{address}`, `/v1/orders/{address}`, `/v1/markets`, `/v1/ticker/{market}`, `/v1/health`, `/v1/adl/queue/{market}`, `/v1/withdrawal/{id}`, and the `/v1/history/**` family.
+
+  **Default:** `https://api.dev.proof.trade`
+
+  This is separate from `rpcUrl` so you can point the read path at a different host than the CometBFT RPC — useful when running a read-replica behind a CDN:
+
+  ```typescript
+  const client = new ExchangeClient({
+    rpcUrl: "http://rpc.internal:26657",
+    apiUrl: "http://api.internal:8080",
+  });
+  ```
+</ParamField>
+
+---
+
+### `wsUrl`
+
+<ParamField body="wsUrl" type="string" optional>
+  WebSocket URL for CometBFT event subscriptions, used by `subscribeBlocks`. The client subscribes to both `tm.event='NewBlock'` and `tm.event='Tx'` on this connection.
+
+  **Default:** Derived from `rpcUrl` by replacing the `http`/`https` scheme with `ws`/`wss` and appending `/websocket`. For example, `https://api.dev.proof.trade` becomes `wss://api.dev.proof.trade/websocket`.
+
+  Override when your WebSocket endpoint is at a different path or host:
+
+  ```typescript
+  const client = new ExchangeClient({
+    wsUrl: "wss://ws.example.com/cometbft",
+  });
+  ```
+</ParamField>
+
+---
+
+### `gatewayUrl`
+
+<ParamField body="gatewayUrl" type="string" optional>
+  Base URL for the public API gateway. Used by `submitTx` when `useGateway` is `true` (the default) — the client POSTs the signed wire bytes to `{gatewayUrl}/exchange`.
+
+  **Default:** Derived from `rpcUrl` by remapping port `26657` to `9080`. If `rpcUrl` does not contain port `26657`, the origin is used unchanged. For example, `http://localhost:26657` becomes `http://localhost:9080`.
+
+  If the automatic derivation does not match your stack, set this explicitly:
+
+  ```typescript
+  const client = new ExchangeClient({
+    rpcUrl: "http://localhost:26657",
+    gatewayUrl: "http://localhost:9080",
+  });
+  ```
+</ParamField>
+
+---
+
+## Chain ID Options
+
+### `chainId`
+
+<ParamField body="chainId" type="string" optional>
+  CometBFT `chain_id` string — for example `"exchange-devnet-1"` or `"proof-testnet-1"`. This value is hashed (SHA-256) and embedded in the V3 signing message, binding signatures to a specific chain and closing cross-chain replay vectors.
+
+  **Default:** Not set. When omitted, the client lazily fetches the `network` field from `${rpcUrl}/status` (`result.node_info.network`) on the first `submitTx` call and caches the result for the lifetime of the instance.
+
+  **Recommended practice:** Pin `chainId` explicitly in production. Lazy resolution adds one round-trip to the first submission and may throw if the node is temporarily unavailable. It also means signatures are not fully deterministic across SDK rebuilds if the node's reported chain ID changes.
+
+  Pre-warm the lazy resolution at startup with `await client.ready()` to surface errors early without having to pin the value:
+
+  ```typescript
+  // Option A — pin explicitly (recommended for production)
+  const client = new ExchangeClient({
+    chainId: "exchange-devnet-1",
+  });
+
+  // Option B — lazy with early error surface
+  const client = new ExchangeClient({ rpcUrl: "https://rpc.example.com" });
+  await client.ready(); // throws if /status is unreachable
+  ```
+
+  The Proof devnet chain ID is `exchange-devnet-1`.
+</ParamField>
+
+---
+
+### `allowUnbound`
+
+<ParamField body="allowUnbound" type="boolean" optional>
+  When `true`, the client falls back to `UNBOUND_CHAIN_ID` if `chainId` is not set **and** the `/status` fetch fails. This allows the client to sign transactions without a live chain connection.
+
+  **Default:** `false`
+
+  <Warning>
+    **Never set `allowUnbound: true` in production or in any path that submits transactions to a real chain.** An `UNBOUND_CHAIN_ID` signature is replayable across any deployment that lacks a chain ID binding, and will be rejected by any engine configured with a real `chain_id`. This flag exists only for offline fixtures — for example, constructing a signed envelope to inspect its wire bytes without a running node.
+  </Warning>
+
+  ```typescript
+  // Only for offline testing — never production
+  const client = new ExchangeClient({
+    allowUnbound: true,
+  });
+  ```
+</ParamField>
+
+---
+
+## Submission Options
+
+### `useGateway`
+
+<ParamField body="useGateway" type="boolean" optional>
+  Controls which submission path `submitTx` uses for broadcasting signed transactions.
+
+  **Default:** `true`
+
+  | Value | Behavior |
+  |-------|----------|
+  | `true` | POSTs the signed wire bytes to `{gatewayUrl}/exchange`. The gateway verifies the signature, applies rate limiting, optionally checks `X-Api-Key`, and forwards to CometBFT's `broadcast_tx_sync`. **This is the production path.** |
+  | `false` | Calls CometBFT's `broadcast_tx_sync` directly over `rpcUrl`. Bypasses the gateway, its rate limiting, and auth. Intended for internal tools (market makers, oracle feeders) that need maximum throughput and direct node access. |
+
+  Both paths submit identical V3 signed MessagePack envelopes — switching `useGateway` only changes which surface validates and forwards the bytes.
+
+  ```typescript
+  // Internal tool — bypass gateway
+  const client = new ExchangeClient({
+    rpcUrl: "http://internal-node:26657",
+    useGateway: false,
+  });
+  ```
+</ParamField>
+
+---
+
+### `apiKey`
+
+<ParamField body="apiKey" type="string" optional>
+  Value sent as the `X-Api-Key` request header on every gateway-path submission. Required when the gateway is started with the `--api-key <key>` flag.
+
+  **Default:** Not set (no header sent).
+
+  This option is ignored when `useGateway` is `false`. Read endpoints (`GET /health`, `POST /info`) never require this header.
+
+  ```typescript
+  const client = new ExchangeClient({
+    apiKey: process.env.PROOF_API_KEY,
+  });
+  ```
+
+  When the gateway requires an API key and none is provided (or it is wrong), `submitTx` returns `TxResult` with `code: 401` and a log explaining the failure.
+</ParamField>
+
+---
+
+## Deprecated Options
+
+### `concurrentNonces`
+
+<ParamField body="concurrentNonces" type="boolean" optional>
+  **Deprecated.** This flag was previously used to enable a concurrent nonce allocation mode. It is now ignored — the SDK allocates timestamp nonces using `max(now_ms, last_nonce + 1)`, which is inherently concurrency-safe without any additional coordination.
+
+  Passing this field has no effect and will not cause an error. It may be removed in a future major release.
+</ParamField>
+
+---
+
+## Configuration Examples
+
+### Devnet (default)
+
+The SDK targets the Proof public devnet out of the box. You only need to pass `chainId` to skip the lazy `/status` fetch:
+
+```typescript
+import { ExchangeClient } from "@proof/trading-sdk";
+
+const client = new ExchangeClient({
+  chainId: "exchange-devnet-1",
+});
+```
+
+| Setting     | Value                         |
+|-------------|-------------------------------|
+| Gateway URL | `https://api.dev.proof.trade` |
+| API URL     | `https://api.dev.proof.trade` |
+| RPC URL     | `https://api.dev.proof.trade` |
+| Chain ID    | `exchange-devnet-1`           |
+
+---
+
+### Gateway with API Key
+
+When connecting to a gateway instance that requires an API key:
+
+```typescript
+const client = new ExchangeClient({
+  chainId: "exchange-devnet-1",
+  apiKey: process.env.PROOF_API_KEY,
+});
+```
+
+---
+
+### Local Development Stack
+
+Point every endpoint at local services. Explicitly setting `chainId` avoids a `/status` round-trip on startup:
+
+```typescript
+const client = new ExchangeClient({
+  rpcUrl: "http://localhost:26657",
+  apiUrl: "http://localhost:8080",
+  gatewayUrl: "http://localhost:9080",
+  chainId: "proof-dev",
+});
+```
+
+The `gatewayUrl` here is explicitly set to `http://localhost:9080`. Without it, the SDK would derive it automatically by remapping port `26657` → `9080`, so it resolves to the same value — but explicit is clearer in local configs.
+
+---
+
+### Direct CometBFT Submission (Internal Tools)
+
+For market makers, oracle feeders, and other internal tools that need to bypass the gateway:
+
+```typescript
+const client = new ExchangeClient({
+  rpcUrl: "http://internal-node:26657",
+  apiUrl: "http://internal-api:8080",
+  useGateway: false,
+  chainId: "proof-mainnet-1",
+});
+```
+
+---
+
+### Pre-warm Chain ID at Init
+
+Avoid a lazy `/status` fetch mid-flow by calling `ready()` after construction when you don't want to hard-code `chainId`:
+
+```typescript
+const client = new ExchangeClient({
+  rpcUrl: "https://rpc.example.com",
+});
+
+// Resolves chain ID now; throws if /status is unreachable
+await client.ready();
+
+client.setPrivateKey(privateKey);
+// All subsequent submitTx calls use the cached chain ID
+```

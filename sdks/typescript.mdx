@@ -1,0 +1,262 @@
+---
+title: "TypeScript SDK Reference for the Proof Exchange"
+sidebarTitle: "TypeScript"
+description: "Complete reference for @proof/trading-sdk: install, all exports by category, ExchangeClient usage, crypto helpers, codec, and error handling."
+---
+
+The `@proof/trading-sdk` package is the primary TypeScript interface for the Proof Exchange. It bundles Ed25519 signing, MessagePack encoding, a full-featured HTTP/WebSocket client, and typed action builders into a single ESM-only package — everything you need to sign, encode, and submit transactions from Node or a browser environment.
+
+## Installation
+
+<CodeGroup>
+
+```bash npm
+npm install @proof/trading-sdk
+```
+
+```bash yarn
+yarn add @proof/trading-sdk
+```
+
+```bash pnpm
+pnpm add @proof/trading-sdk
+```
+
+</CodeGroup>
+
+### Requirements
+
+<CardGroup cols={3}>
+  <Card title="Node 18+" icon="node-js">
+    The SDK uses the native `fetch` API and `WebSocket` globals available from Node 18 onwards.
+  </Card>
+  <Card title="TypeScript 6+" icon="code">
+    Compiled with `"module": "ESNext"` and strict mode. TypeScript 6 or later is required for development.
+  </Card>
+  <Card title="ESM only" icon="brackets-curly">
+    The package sets `"type": "module"`. All local imports must use `.js` extensions even when the source file is `.ts`.
+  </Card>
+</CardGroup>
+
+### Runtime dependencies
+
+| Package | Version | Purpose |
+|---|---|---|
+| `@msgpack/msgpack` | `^3.0.0-beta.3` | Wire encoding / decoding |
+| `@noble/ed25519` | `^3.1.0` | Ed25519 key generation and signing |
+| `@noble/hashes` | `^2.2.0` | keccak256 (owner derivation), SHA-256 (tx hash) |
+
+---
+
+## Exports reference
+
+All public symbols are re-exported from the package root. Import from `@proof/trading-sdk` — never from sub-paths like `@proof/trading-sdk/codec`.
+
+### Types
+
+Core primitive and domain types used throughout every other module.
+
+```ts
+import {
+  type Address,
+  Side,
+  TimeInForce,
+  ActionType,
+  type ActionTypeValue,
+  type Action,
+} from "@proof/trading-sdk";
+```
+
+**Enums**
+
+| Symbol | Kind | Description |
+|---|---|---|
+| `Side` | `enum` | `Buy` \| `Sell` — order side |
+| `TimeInForce` | `enum` | `Gtc` \| `Ioc` \| `Fok` |
+| `ActionType` | `enum` | Discriminant for every action variant |
+| `Branch` | `enum` | `Yes` \| `No` branch on a conditional market |
+| `Outcome` | `enum` | Resolution outcome for an impact market |
+
+**Action interfaces** — one per wire action type:
+
+`PlaceOrder`, `CancelOrder`, `CancelClientOrder`, `CancelAllOrders`, `CancelReplaceOrder`, `AmendOrder`, `AtomicBasketLeg`, `AtomicBasketOrder`, `ClosePosition`, `OracleUpdate`, `MarketOrder`, `Deposit`, `Withdraw`, `WithdrawRequest`, `ConfirmDeposit`, `ConfirmWithdrawal`, `FailWithdrawal`, `ApproveAgent`, `RevokeAgent`, `CreateMarket`, `CreateImpactMarket`, `EventOracleSource`, `PriceComparison`, `ResolveEvent`, `UpdateMarketFees`, `SetUserMarketLeverage`, `ImpactMarketInfo`, `ImpactMarketStatus`
+
+**Transaction result and event types:**
+
+`TxResult`, `TxEvent`, `ExchangeEvent`, `OrderPlacedEvent`, `OrderCancelledEvent`, `TradeExecutedEvent`, `PositionUpdatedEvent`, `PositionClosedEvent`, `PriceUpdatedEvent`, `FundingAppliedEvent`, `FundingSettledEvent`, `AccountLiquidatedEvent`, `MarketCreatedEvent`, `AgentApprovedEvent`, `AgentRevokedEvent`, `FeesCollectedEvent`
+
+**Query response types:**
+
+`Orderbook`, `OrderbookLevel`, `OpenOrder`, `AccountInfo`, `PositionInfo`, `MarketConfig`, `MarkSourceMode`, `AdlQueueEntry`, `Ticker`, `BindingScenarioEntry`, `HistoryCashFlow`, `HistoryResolution`, `HistoryPositionSnapshot`, `WithdrawalStatus`, `WithdrawalRecord`, `MarketKind`, `FeeTier`
+
+---
+
+### Crypto
+
+Low-level Ed25519 and address utilities. Use these directly when you need to manage keys or sign wire bytes outside of `ExchangeClient`.
+
+```ts
+import {
+  generateKeypair,
+  getPublicKey,
+  pubkeyToOwner,
+  ownerToHex,
+  hexToBytes,
+  bytesToHex,
+  signingMessage,
+  sign,
+  verify,
+  chainIdFromString,
+  UNBOUND_CHAIN_ID,
+} from "@proof/trading-sdk";
+```
+
+| Function / Constant | Signature | Description |
+|---|---|---|
+| `generateKeypair` | `() → { privateKey, publicKey }` | Generate a new random Ed25519 keypair |
+| `getPublicKey` | `(privateKey: Uint8Array) → Uint8Array` | Derive the 32-byte public key from a private key |
+| `pubkeyToOwner` | `(pubkey: Uint8Array) → Uint8Array` | Derive the 20-byte owner address via keccak256 |
+| `ownerToHex` | `(owner: Uint8Array) → string` | Encode 20-byte address to a 40-char hex string (no `0x`) |
+| `hexToBytes` | `(hex: string) → Uint8Array` | Decode a hex string to bytes |
+| `bytesToHex` | `(bytes: Uint8Array) → string` | Encode bytes to lowercase hex |
+| `signingMessage` | `(chainId, actionType, seq, payload) → Uint8Array` | Build the canonical `ProofExchange-v3` domain-prefixed signing message |
+| `sign` | `(privateKey, message) → Promise<Uint8Array>` | Sign a 64-byte Ed25519 signature |
+| `verify` | `(pubkey, message, signature) → Promise<boolean>` | Verify an Ed25519 signature |
+| `chainIdFromString` | `(network: string) → Uint8Array` | Hash a CometBFT network string to a 32-byte chain ID |
+| `UNBOUND_CHAIN_ID` | `Uint8Array` | 32 zero bytes — for offline fixtures only; replayable on real chains |
+
+---
+
+### Codec
+
+Functions that encode typed actions into signed MessagePack wire envelopes and decode them back.
+
+```ts
+import {
+  encodeSignedTx,
+  signAndEncode,
+  signEnvelopeFromPayload,
+  encodePayloadBytes,
+  decodeTx,
+  peekActionType,
+} from "@proof/trading-sdk";
+```
+
+| Function | Description |
+|---|---|
+| `signAndEncode` | Sign an `Action` with a private key and chain ID, returning the complete wire envelope bytes |
+| `encodeSignedTx` | Assemble a wire envelope from an action + pre-computed pubkey and signature (gateway relay path) |
+| `signEnvelopeFromPayload` | Sign raw pre-encoded payload bytes + action type into an envelope (for bindings that hold raw bytes) |
+| `encodePayloadBytes` | Encode an action to its raw MessagePack payload bytes without signing |
+| `decodeTx` | Fully decode a wire envelope: returns the typed `Action`, seq, pubkey, and signature |
+| `peekActionType` | Extract the action type byte from a wire tx without deserialising the full payload |
+
+<Note>
+The wire format is a 6-element MessagePack fixarray: `[version=2, action_type, seq, payload_bytes, pubkey, signature]`. Integers are encoded with minimal width (no padding), matching the Rust codec's `rmp-serde` output exactly. Do not construct envelopes manually.
+</Note>
+
+---
+
+### Client
+
+The high-level client that manages chain-ID resolution, nonce allocation, gateway or CometBFT submission, and all query endpoints.
+
+```ts
+import { ExchangeClient, type ExchangeClientOptions, fetchChainId } from "@proof/trading-sdk";
+```
+
+#### `ExchangeClientOptions`
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `rpcUrl` | `string` | `https://api.dev.proof.trade` | CometBFT RPC endpoint |
+| `apiUrl` | `string` | `https://api.dev.proof.trade` | Go REST API endpoint |
+| `wsUrl` | `string` | Derived from `rpcUrl` | WebSocket URL for event subscriptions |
+| `chainId` | `string` | — | CometBFT chain ID string (e.g. `"proof-testnet-1"`). Pin this in production to prevent cross-chain replay. |
+| `gatewayUrl` | `string` | Derived from `rpcUrl` | Public gateway endpoint for `POST /exchange` |
+| `useGateway` | `boolean` | `true` | Route submissions through the public gateway (auth, rate-limiting); set `false` for internal tools |
+| `apiKey` | `string` | — | `X-Api-Key` header value for gateway authentication |
+| `allowUnbound` | `boolean` | `false` | Fall back to `UNBOUND_CHAIN_ID` if `/status` is unreachable. Never use in production. |
+
+#### Key `ExchangeClient` methods
+
+```ts
+const client = new ExchangeClient({ chainId: "proof-testnet-1" });
+client.setPrivateKey(privateKey);
+await client.ready(); // pre-warm chain-ID resolution
+
+// Submit fire-and-forget (spawns background DeliverTx verifier)
+const result = await client.submitTx(action);
+
+// Submit and wait for block inclusion
+const committed = await client.submitTxCommit(action);
+
+// Drain background verifier results
+const deliveries = await client.awaitPendingVerifies();
+
+// Query endpoints
+const account = await client.queryAccount(ownerHex);
+const orderbook = await client.queryOrderbook(marketId);
+const orders = await client.queryOpenOrders(ownerHex);
+const markets = await client.queryMarkets();
+const ticker = await client.queryTicker(marketId);
+
+// WebSocket subscription
+const unsub = client.subscribeBlocks((event) => console.log(event));
+client.disconnect(); // close WebSocket
+```
+
+#### `fetchChainId`
+
+```ts
+const chainId: Uint8Array = await fetchChainId("https://api.dev.proof.trade");
+```
+
+Fetches `GET /status` from a CometBFT RPC, reads `result.node_info.network`, and returns its 32-byte SHA-256 hash. `ExchangeClient` uses this lazily on first submit; call it directly for offline signing tools.
+
+---
+
+### Errors
+
+```ts
+import {
+  type ExecErrorInfo,
+  decodeExecError,
+  execErrorName,
+} from "@proof/trading-sdk";
+```
+
+| Symbol | Description |
+|---|---|
+| `ExecErrorInfo` | Interface holding `code`, `name`, and `message` for an engine rejection |
+| `decodeExecError` | Parse the `log` string from a `TxResult` into an `ExecErrorInfo` |
+| `execErrorName` | Look up a canonical error name from a numeric engine error code (e.g. `21 → "InvalidNonce"`) |
+
+Common engine codes to handle:
+
+| Code | Name | Action |
+|---|---|---|
+| `0` | Success | — |
+| `1` | `DecodeError` | Malformed envelope — inspect payload construction |
+| `12` | `InsufficientMargin` | Reduce order size or deposit more collateral |
+| `21` | `InvalidNonce` | Pick a fresh millisecond timestamp and retry |
+| `401` | Auth failure (gateway) | Check your `apiKey` |
+| `429` | Rate limited (gateway) | Back off and retry |
+
+---
+
+## Building from source
+
+```bash
+npm install
+npm run build   # tsc → dist/
+npm test        # vitest run
+```
+
+The build output in `dist/` is what gets published. All imports within `dist/` use `.js` extensions — TypeScript's `"moduleResolution": "bundler"` does not rewrite extensions, so source files must reference `./foo.js` even when the actual source is `foo.ts`.
+
+Run a live example (requires a running devnet gateway):
+
+```bash
+npx tsx examples/connect-and-trade.ts
+```

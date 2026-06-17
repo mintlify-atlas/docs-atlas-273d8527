@@ -1,0 +1,298 @@
+---
+title: "MessagePack Codec: Encode and Decode Transactions"
+sidebarTitle: "Codec"
+description: "Sign, encode, and decode Proof Exchange transactions as MessagePack wire bytes using the V2 envelope format with rmp-serde-compatible BigInt handling."
+---
+
+The codec module is the bridge between an `Action` object and the raw bytes the exchange accepts over the wire. It serialises action payloads with `@msgpack/msgpack`, constructs the deterministic signing message, applies an Ed25519 signature, and wraps everything into the V2 wire envelope — all in a single call. A matching decoder lets you inspect or round-trip any signed transaction without communicating with the exchange. Understanding the codec is essential for offline signing, cross-language conformance testing, and any integration that manages transaction bytes directly rather than delegating to `ExchangeClient`.
+
+## Wire Envelope Format
+
+Every signed transaction is a 6-element MessagePack array:
+
+```
+[version(2), action_type(u8), seq(u64), payload(bin), pubkey(32B bin), signature(64B bin)]
+```
+
+| Index | Field | Type | Description |
+|---|---|---|---|
+| 0 | `version` | `number` | Always `2` for the current V2 envelope |
+| 1 | `action_type` | `number` | Single-byte `ActionType` wire value |
+| 2 | `seq` | `bigint` | Monotonically increasing sequence number |
+| 3 | `payload` | `Uint8Array` | MessagePack-encoded action payload (inner envelope) |
+| 4 | `pubkey` | `Uint8Array` | 32-byte Ed25519 public key of the signer |
+| 5 | `signature` | `Uint8Array` | 64-byte Ed25519 signature over the V3 signing message |
+
+### BigInt and Minimal-Int Encoding
+
+The exchange engine uses `rmp-serde` (Rust), which always writes integers in their minimal MessagePack form — a `u32` field with value `1` becomes a 1-byte positive fixint, not a 9-byte uint64. `@msgpack/msgpack` with `useBigInt64: true` would write every `BigInt` as a 9-byte uint64, even for small values, causing the payload bytes to differ from what the engine re-encodes during signature verification.
+
+The codec resolves this by walking the value tree before encoding and converting any `BigInt` in the range `0..=2^32-1` to a plain `Number`. `@msgpack/msgpack` then applies its own minimal-int encoding (fixint / uint8 / uint16 / uint32), matching `rmp-serde` exactly. `BigInt` values ≥ `2^32` are kept as `BigInt` so `useBigInt64` emits them as uint64 — which also matches `rmp-serde` for those magnitudes.
+
+<Note>
+  Envelope fields `pubkey` and `signature` are encoded as MessagePack `bin` (byte string), because the Rust `WireTxEnvelope` uses `#[serde(with = "serde_bytes")]` for those slots. Action payload byte-array fields (owner addresses, signer addresses) are encoded as msgpack arrays of `u8` integers, because the Rust action structs use plain `[u8; N]` without `serde_bytes`.
+</Note>
+
+---
+
+## Primary Functions
+
+### `signAndEncode(chainId, action, seq, privateKey)`
+
+The main encoding path for offline signing. Encodes the action payload, constructs the V3 signing message, computes the Ed25519 signature, derives the public key from `privateKey`, and returns the complete signed wire envelope ready for submission.
+
+```typescript
+import { signAndEncode, fetchChainId } from "@proof/trading-sdk";
+
+const chainId = await fetchChainId("https://api.dev.proof.trade");
+
+const txBytes = signAndEncode(
+  chainId,
+  { type: "PlaceOrder", data: { market: 1, owner, side: Side.Buy, price: 6675234n, quantity: 1n } },
+  BigInt(Date.now()),
+  privateKey,
+);
+// txBytes — Uint8Array ready to POST to /exchange
+```
+
+<ParamField path="chainId" type="Uint8Array" required>
+  32-byte chain ID binding. Production callers must supply `chainIdFromString(cometbftChainId)` or the result of `fetchChainId`. Only pass `UNBOUND_CHAIN_ID` in unit tests.
+</ParamField>
+
+<ParamField path="action" type="Action" required>
+  Discriminated-union action object, e.g. `{ type: "PlaceOrder", data: { ... } }`. See [Actions Overview](/api/actions-overview) for all variants.
+</ParamField>
+
+<ParamField path="seq" type="bigint" required>
+  Monotonically increasing sequence number. `BigInt(Date.now())` is the standard approach; the exchange rejects replayed or out-of-order sequences.
+</ParamField>
+
+<ParamField path="privateKey" type="Uint8Array" required>
+  32-byte Ed25519 secret key. The public key is derived internally — never included in the return value in plaintext; only the signature and public key are embedded in the envelope.
+</ParamField>
+
+<ResponseField name="return" type="Uint8Array">
+  Complete V2 signed wire envelope as MessagePack bytes, ready for direct submission.
+</ResponseField>
+
+---
+
+### `encodeSignedTx(action, seq, pubkey, signature)`
+
+Assembles the V2 wire envelope from an already-encoded action and pre-computed signature components. Use this when you hold raw signature bytes from an external signing device, HSM, or MPC wallet rather than a raw private key.
+
+```typescript
+import { encodeSignedTx } from "@proof/trading-sdk";
+
+const envelope = encodeSignedTx(action, seq, pubkey, signature);
+```
+
+<ParamField path="action" type="Action" required>
+  Discriminated-union action object. The codec encodes the payload internally.
+</ParamField>
+
+<ParamField path="seq" type="bigint" required>
+  Sequence number to embed in the wire envelope.
+</ParamField>
+
+<ParamField path="pubkey" type="Uint8Array" required>
+  32-byte Ed25519 public key of the signer. Encoded as MessagePack `bin` in the envelope.
+</ParamField>
+
+<ParamField path="signature" type="Uint8Array" required>
+  64-byte Ed25519 signature over the V3 signing message. Encoded as MessagePack `bin` in the envelope.
+</ParamField>
+
+<ResponseField name="return" type="Uint8Array">
+  Complete V2 wire envelope as MessagePack bytes.
+</ResponseField>
+
+---
+
+### `signEnvelopeFromPayload(chainId, actionType, seq, payloadBytes, privateKey)`
+
+Signs and wraps a pre-encoded payload into a V2 signed envelope. Lower-level than `signAndEncode` — callers supply raw MessagePack payload bytes and the numeric action type directly, bypassing the `Action`-object encoder. Useful for cross-language conformance testing where payload bytes are pre-computed by a reference implementation.
+
+```typescript
+import { signEnvelopeFromPayload, encodePayloadBytes } from "@proof/trading-sdk";
+import { ActionType } from "@proof/trading-sdk";
+
+const payloadBytes = encodePayloadBytes(action);
+const envelope = signEnvelopeFromPayload(
+  chainId,
+  ActionType.PlaceOrder,  // 0x01
+  seq,
+  payloadBytes,
+  privateKey,
+);
+```
+
+<ParamField path="chainId" type="Uint8Array" required>
+  32-byte chain ID. Must be exactly 32 bytes.
+</ParamField>
+
+<ParamField path="actionType" type="number" required>
+  Single-byte action type wire value (e.g. `ActionType.PlaceOrder` = `0x01`).
+</ParamField>
+
+<ParamField path="seq" type="bigint" required>
+  Sequence number for the signing message and the envelope.
+</ParamField>
+
+<ParamField path="payloadBytes" type="Uint8Array" required>
+  Already-encoded MessagePack payload bytes, typically from `encodePayloadBytes` or a reference implementation.
+</ParamField>
+
+<ParamField path="privateKey" type="Uint8Array" required>
+  32-byte Ed25519 secret key used to sign the V3 message and derive the embedded public key.
+</ParamField>
+
+<ResponseField name="return" type="Uint8Array">
+  Complete V2 signed wire envelope as MessagePack bytes.
+</ResponseField>
+
+---
+
+### `encodePayloadBytes(action)`
+
+Encodes only the action payload — the inner `payload` field of the wire envelope — without the surrounding signature envelope. Useful for cross-SDK conformance testing, since payload bytes must match byte-for-byte across Rust, Python, and TypeScript implementations.
+
+```typescript
+import { encodePayloadBytes } from "@proof/trading-sdk";
+
+const payloadBytes = encodePayloadBytes({
+  type: "CancelOrder",
+  data: { orderId: 123456n, owner },
+});
+// MessagePack bytes; no version, seq, pubkey, or signature
+```
+
+<ParamField path="action" type="Action" required>
+  Any member of the `Action` discriminated union.
+</ParamField>
+
+<ResponseField name="return" type="Uint8Array">
+  MessagePack-encoded payload array. Field order matches the Rust struct definitions; changing field order breaks signature verification.
+</ResponseField>
+
+---
+
+## Decoding Functions
+
+### `decodeTx(bytes)`
+
+Decodes a complete V2 wire envelope back into its constituent parts. The `seq` field is always returned as `bigint` regardless of how it was encoded on the wire (fixint vs. uint64), so downstream code can rely on a single type.
+
+```typescript
+import { decodeTx } from "@proof/trading-sdk";
+
+const { version, action, seq, pubkey, signature } = decodeTx(txBytes);
+
+console.log(version);    // 2
+console.log(action.type); // "PlaceOrder"
+console.log(seq);        // bigint
+```
+
+<ParamField path="bytes" type="Uint8Array" required>
+  Raw MessagePack wire bytes as produced by `signAndEncode`, `encodeSignedTx`, or `signEnvelopeFromPayload`.
+</ParamField>
+
+<ResponseField name="version" type="number">
+  Envelope version number. Currently always `2`; the function throws on any other value.
+</ResponseField>
+
+<ResponseField name="action" type="Action">
+  Fully decoded `Action` discriminated-union object with all field types normalised (e.g. `BigInt` for u64 fields, `Uint8Array` for address fields).
+</ResponseField>
+
+<ResponseField name="seq" type="bigint">
+  Sequence number, always returned as `bigint`.
+</ResponseField>
+
+<ResponseField name="pubkey" type="Uint8Array">
+  32-byte Ed25519 public key extracted from the envelope.
+</ResponseField>
+
+<ResponseField name="signature" type="Uint8Array">
+  64-byte Ed25519 signature extracted from the envelope.
+</ResponseField>
+
+---
+
+### `peekActionType(bytes)`
+
+Reads the `action_type` byte from a wire envelope without performing a full decode. Returns `null` if the bytes cannot be parsed.
+
+```typescript
+import { peekActionType } from "@proof/trading-sdk";
+import { ActionType } from "@proof/trading-sdk";
+
+const actionType = peekActionType(txBytes);
+if (actionType === ActionType.PlaceOrder) {
+  // fast path — no full decode needed
+}
+```
+
+<ParamField path="bytes" type="Uint8Array" required>
+  Raw MessagePack wire bytes.
+</ParamField>
+
+<ResponseField name="return" type="ActionTypeValue | null">
+  The numeric `ActionType` value at index 1 of the envelope array, or `null` if decoding fails.
+</ResponseField>
+
+---
+
+## Complete Example
+
+```typescript
+import {
+  signAndEncode,
+  decodeTx,
+  fetchChainId,
+  generateKeypair,
+  pubkeyToOwner,
+} from "@proof/trading-sdk";
+import { Side } from "@proof/trading-sdk";
+
+// 1. Set up identity
+const { privateKey, publicKey } = generateKeypair();
+const owner = pubkeyToOwner(publicKey);
+
+// 2. Resolve the chain ID from the exchange (cached after first call)
+const chainId = await fetchChainId("https://api.dev.proof.trade");
+
+// 3. Construct and sign a PlaceOrder transaction
+const action = {
+  type: "PlaceOrder" as const,
+  data: {
+    market: 1,
+    owner,
+    side: Side.Buy,
+    price: 6675234n,   // $66,752.34 in micro-USDC
+    quantity: 1n,
+  },
+};
+
+const seq     = BigInt(Date.now());
+const txBytes = signAndEncode(chainId, action, seq, privateKey);
+
+// 4. Inspect the signed transaction before sending
+const decoded = decodeTx(txBytes);
+// decoded.version    === 2
+// decoded.action.type === "PlaceOrder"
+// decoded.seq        === seq (as bigint)
+// decoded.pubkey     — 32-byte Uint8Array
+// decoded.signature  — 64-byte Uint8Array
+
+// 5. Submit via ExchangeClient or raw HTTP POST to /exchange
+```
+
+---
+
+## Underlying Libraries
+
+| Library | Purpose |
+|---|---|
+| `@msgpack/msgpack` | MessagePack encoder (`Encoder`) and decoder (`Decoder`), both configured with `useBigInt64: true`. The encoder is wrapped with `minimizeBigInts` to ensure `rmp-serde` compatibility. |
+| `@proof/trading-sdk` (crypto) | `signingMessage`, `sign`, and `getPublicKey` used internally by `signAndEncode` and `signEnvelopeFromPayload`. |

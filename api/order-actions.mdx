@@ -1,0 +1,475 @@
+---
+title: "Order Action Types: Place, Cancel, and Replace"
+sidebarTitle: "Order Actions"
+description: "Full field reference for every order-management action: PlaceOrder, CancelOrder, MarketOrder, ClosePosition, AtomicBasketOrder, and all cancel/amend variants."
+---
+
+Order actions are the core of day-to-day trading on the Proof Exchange. They cover the full lifecycle of a resting order — creation, modification, cancellation, and position closure — plus the atomic basket primitive for multi-leg strategies. Every order action is user-signed: the envelope signer's derived address must match the `owner` field (or belong to an approved agent). Type signatures are drawn directly from `src/types.ts`.
+
+---
+
+## PlaceOrder
+
+Place a limit order on the order book. The order rests until filled, cancelled, or expired (if `defaultTtlMs` is set on the market).
+
+```typescript
+export interface PlaceOrder {
+  market: number;
+  owner: Address;
+  side: Side;
+  price: bigint;
+  quantity: bigint;
+  clientOrderId?: bigint | null;
+  postOnly?: boolean;
+  reduceOnly?: boolean;
+  timeInForce?: TimeInForce;
+}
+```
+
+<ParamField body="market" type="number" required>
+  Market identifier (unique integer). Use `1` for BTC-PERP, `2` for ETH-PERP, etc.
+</ParamField>
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address derived from the Ed25519 public key via `pubkeyToOwner(publicKey)`.
+</ParamField>
+
+<ParamField body="side" type="Side" required>
+  Order side: `Side.Buy` (1) to go long, `Side.Sell` (2) to go short.
+</ParamField>
+
+<ParamField body="price" type="bigint" required>
+  Limit price in integer cents with 2 decimal places. For example, `6675234n` represents $66,752.34.
+</ParamField>
+
+<ParamField body="quantity" type="bigint" required>
+  Order quantity in integer contracts (lots). `1n` = 1 lot.
+</ParamField>
+
+<ParamField body="clientOrderId" type="bigint | null">
+  Optional client-assigned order ID for correlation and deduplication. Echoed in `OrderPlacedEvent` and subsequent cancel/fill events.
+</ParamField>
+
+<ParamField body="postOnly" type="boolean">
+  When `true`, the engine rejects the order if it would cross the book on placement (`PostOnlyWouldCross`, error code 34). Use this to guarantee maker-side execution. Defaults to `false`.
+</ParamField>
+
+<ParamField body="reduceOnly" type="boolean">
+  When `true`, the order may only reduce an existing position. Same-side orders that would increase the position are rejected (`ReduceOnlyWouldIncrease`, error code 35); over-closing quantity is clamped to the current position size. Defaults to `false`.
+</ParamField>
+
+<ParamField body="timeInForce" type="TimeInForce">
+  Time-in-force policy. `TimeInForce.Gtc` (default) — unmatched quantity rests on the book. `TimeInForce.Ioc` — unmatched quantity is dropped after crossing. `TimeInForce.Fok` — the entire order must fill immediately or is rejected without any mutation.
+</ParamField>
+
+```typescript
+import { Side, TimeInForce } from "@proof/trading-sdk";
+
+await client.submitTx({
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: address,
+    side: Side.Buy,
+    price: 6675234n,      // $66,752.34
+    quantity: 2n,
+    clientOrderId: 42n,
+    postOnly: true,
+    timeInForce: TimeInForce.Gtc,
+  },
+});
+```
+
+---
+
+## CancelOrder
+
+Cancel an existing resting order by its engine-assigned ID.
+
+```typescript
+export interface CancelOrder {
+  orderId: bigint;
+  owner: Address;
+}
+```
+
+<ParamField body="orderId" type="bigint" required>
+  Engine-assigned order ID to cancel. Obtain this from the `OrderPlacedEvent.orderId` field or from `queryOpenOrders`.
+</ParamField>
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address of the order owner. Must match the order's recorded owner; the engine rejects mismatches.
+</ParamField>
+
+```typescript
+await client.submitTx({
+  type: "CancelOrder",
+  data: {
+    orderId: 100123n,
+    owner: address,
+  },
+});
+```
+
+---
+
+## CancelClientOrder
+
+Cancel a resting order using the owner-scoped client order ID assigned at placement. Useful when you know your own ID but have not yet observed the engine-assigned ID.
+
+```typescript
+export interface CancelClientOrder {
+  owner: Address;
+  clientOrderId: bigint;
+}
+```
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address of the order owner.
+</ParamField>
+
+<ParamField body="clientOrderId" type="bigint" required>
+  The client-assigned order ID originally passed in `PlaceOrder.clientOrderId`.
+</ParamField>
+
+```typescript
+await client.submitTx({
+  type: "CancelClientOrder",
+  data: {
+    owner: address,
+    clientOrderId: 42n,
+  },
+});
+```
+
+---
+
+## CancelAllOrders
+
+Cancel all resting orders for an account, optionally scoped to a single market.
+
+```typescript
+export interface CancelAllOrders {
+  owner: Address;
+  market?: number | null;
+}
+```
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address whose resting orders should be cancelled.
+</ParamField>
+
+<ParamField body="market" type="number | null">
+  Optional market scope. Pass a market ID to cancel only orders on that market. Omit or pass `null` to cancel across all markets.
+</ParamField>
+
+```typescript
+// Cancel all orders across every market
+await client.submitTx({
+  type: "CancelAllOrders",
+  data: { owner: address },
+});
+
+// Cancel only orders on market 1
+await client.submitTx({
+  type: "CancelAllOrders",
+  data: { owner: address, market: 1 },
+});
+```
+
+---
+
+## CancelReplaceOrder
+
+Atomically cancel one resting order and place its replacement in a single transaction. If the cancel half fails (e.g., the order is already filled), the placement does not execute.
+
+```typescript
+export interface CancelReplaceOrder {
+  owner: Address;
+  cancelOrderId?: bigint | null;
+  cancelClientOrderId?: bigint | null;
+  market: number;
+  side: Side;
+  price: bigint;
+  quantity: bigint;
+  clientOrderId?: bigint | null;
+  postOnly?: boolean;
+  reduceOnly?: boolean;
+  timeInForce?: TimeInForce;
+}
+```
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address whose order should be cancelled and replaced.
+</ParamField>
+
+<ParamField body="cancelOrderId" type="bigint | null">
+  Engine-assigned order ID to cancel. Mutually exclusive with `cancelClientOrderId`; provide exactly one.
+</ParamField>
+
+<ParamField body="cancelClientOrderId" type="bigint | null">
+  Owner-scoped client order ID to cancel. Mutually exclusive with `cancelOrderId`; provide exactly one.
+</ParamField>
+
+<ParamField body="market" type="number" required>
+  Market for the replacement order.
+</ParamField>
+
+<ParamField body="side" type="Side" required>
+  Side for the replacement order: `Side.Buy` or `Side.Sell`.
+</ParamField>
+
+<ParamField body="price" type="bigint" required>
+  Replacement limit price in integer cents.
+</ParamField>
+
+<ParamField body="quantity" type="bigint" required>
+  Replacement order quantity in integer contracts.
+</ParamField>
+
+<ParamField body="clientOrderId" type="bigint | null">
+  Optional client-assigned ID for the replacement order.
+</ParamField>
+
+<ParamField body="postOnly" type="boolean">
+  Post-only flag for the replacement order. Defaults to `false`.
+</ParamField>
+
+<ParamField body="reduceOnly" type="boolean">
+  Reduce-only flag for the replacement order. Defaults to `false`.
+</ParamField>
+
+<ParamField body="timeInForce" type="TimeInForce">
+  Time-in-force for the replacement order. Defaults to `TimeInForce.Gtc`.
+</ParamField>
+
+```typescript
+// Replace order 100123 with a new bid at $66,800.00
+await client.submitTx({
+  type: "CancelReplaceOrder",
+  data: {
+    owner: address,
+    cancelOrderId: 100123n,
+    market: 1,
+    side: Side.Buy,
+    price: 6680000n,   // $66,800.00
+    quantity: 2n,
+    clientOrderId: 43n,
+    postOnly: true,
+  },
+});
+```
+
+---
+
+## AmendOrder
+
+Amend an existing resting order's price or quantity in place, preserving the engine-assigned order ID and queue priority (subject to engine rules on price-improving amendments).
+
+```typescript
+export interface AmendOrder {
+  owner: Address;
+  orderId: bigint;
+  newPrice?: bigint | null;
+  newQuantity?: bigint | null;
+}
+```
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address whose order should be amended.
+</ParamField>
+
+<ParamField body="orderId" type="bigint" required>
+  Engine-assigned order ID to amend.
+</ParamField>
+
+<ParamField body="newPrice" type="bigint | null">
+  Optional replacement price in integer cents. Omit or pass `null` to keep the existing price.
+</ParamField>
+
+<ParamField body="newQuantity" type="bigint | null">
+  Optional new total order quantity in integer contracts. Omit or pass `null` to keep the existing quantity.
+</ParamField>
+
+```typescript
+// Move order 100123 to a new price, keeping the same quantity
+await client.submitTx({
+  type: "AmendOrder",
+  data: {
+    owner: address,
+    orderId: 100123n,
+    newPrice: 6690000n,  // $66,900.00
+  },
+});
+```
+
+---
+
+## MarketOrder
+
+Place a market order that crosses immediately against resting orders. Unmatched quantity after crossing is dropped (IOC semantics). Subscribe to `MarketOrderProcessedEvent` to determine how much was filled.
+
+```typescript
+export interface MarketOrder {
+  market: number;
+  owner: Address;
+  side: Side;
+  quantity: bigint;
+  clientOrderId?: bigint | null;
+}
+```
+
+<ParamField body="market" type="number" required>
+  Market identifier.
+</ParamField>
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address of the order owner.
+</ParamField>
+
+<ParamField body="side" type="Side" required>
+  Order side: `Side.Buy` or `Side.Sell`.
+</ParamField>
+
+<ParamField body="quantity" type="bigint" required>
+  Order quantity in integer contracts. Any unfilled remainder after crossing is silently dropped.
+</ParamField>
+
+<ParamField body="clientOrderId" type="bigint | null">
+  Optional client-assigned order ID echoed in the `MarketOrderProcessedEvent`.
+</ParamField>
+
+```typescript
+await client.submitTx({
+  type: "MarketOrder",
+  data: {
+    market: 1,
+    owner: address,
+    side: Side.Sell,
+    quantity: 1n,
+    clientOrderId: 99n,
+  },
+});
+```
+
+---
+
+## ClosePosition
+
+Close an entire open position by placing an opposite-side IOC order priced at oracle ± spread. The action is idempotent — if no position exists the engine returns code 0 without emitting any events. `owner` must equal the envelope signer's derived address; agents cannot close on behalf of owners via this action.
+
+```typescript
+export interface ClosePosition {
+  market: number;
+  owner: Address;
+}
+```
+
+<ParamField body="market" type="number" required>
+  Market identifier of the position to close.
+</ParamField>
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address of the position owner. Must equal the envelope signer's derived address.
+</ParamField>
+
+```typescript
+// Close the entire BTC-PERP position
+await client.submitTx({
+  type: "ClosePosition",
+  data: {
+    market: 1,
+    owner: address,
+  },
+});
+```
+
+---
+
+## AtomicBasketOrder
+
+A native all-or-revert multi-leg basket. Every leg executes as a fill-or-kill limit order at the given price limit. If any single leg cannot fully fill, the entire transaction rolls back through the overlay — no partial state is committed.
+
+```typescript
+export interface AtomicBasketOrder {
+  owner: Address;
+  legs: AtomicBasketLeg[];
+  maxSlippageBps?: number;
+}
+```
+
+<ParamField body="owner" type="Address" required>
+  20-byte account address of the basket owner. Must equal the envelope signer's derived address.
+</ParamField>
+
+<ParamField body="legs" type="AtomicBasketLeg[]" required>
+  Ordered list of basket legs. Each leg executes as a fill-or-kill limit order; the whole basket reverts if any leg fails.
+</ParamField>
+
+<ParamField body="maxSlippageBps" type="number">
+  Basket-wide slippage budget in basis points. The engine enforces each leg's explicit price limit independently; this value is emitted for auditability and client/UI reconciliation only. Encodes as `0` when absent (not `nil`).
+</ParamField>
+
+### AtomicBasketLeg
+
+```typescript
+export interface AtomicBasketLeg {
+  market: number;
+  side: Side;
+  price: bigint;
+  quantity: bigint;
+  clientOrderId?: bigint | null;
+  reduceOnly?: boolean;
+}
+```
+
+<ParamField body="market" type="number" required>
+  Market identifier for this leg.
+</ParamField>
+
+<ParamField body="side" type="Side" required>
+  Leg side: `Side.Buy` or `Side.Sell`.
+</ParamField>
+
+<ParamField body="price" type="bigint" required>
+  Worst acceptable execution price in integer cents. Buy legs will not pay above this; sell legs will not sell below it.
+</ParamField>
+
+<ParamField body="quantity" type="bigint" required>
+  Leg quantity in integer contracts.
+</ParamField>
+
+<ParamField body="clientOrderId" type="bigint | null">
+  Optional client-assigned order ID echoed in events for correlation.
+</ParamField>
+
+<ParamField body="reduceOnly" type="boolean">
+  When `true`, this leg may only reduce an existing position.
+</ParamField>
+
+```typescript
+// Buy 1 BTC-PERP and sell 10 ETH-PERP atomically
+await client.submitTx({
+  type: "AtomicBasketOrder",
+  data: {
+    owner: address,
+    legs: [
+      {
+        market: 1,           // BTC-PERP
+        side: Side.Buy,
+        price: 6680000n,     // max buy price $66,800.00
+        quantity: 1n,
+        clientOrderId: 101n,
+      },
+      {
+        market: 2,           // ETH-PERP
+        side: Side.Sell,
+        price: 350000n,      // min sell price $3,500.00
+        quantity: 10n,
+        clientOrderId: 102n,
+      },
+    ],
+    maxSlippageBps: 20,
+  },
+});
+```

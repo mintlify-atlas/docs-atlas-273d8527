@@ -1,0 +1,158 @@
+---
+title: "Engine Error Codes and Handling Strategies"
+sidebarTitle: "Error Codes"
+description: "Complete reference for TxResult.code values returned by the Proof engine, with decodeExecError() usage, retry patterns, and gateway HTTP error codes."
+---
+
+When you submit a transaction via `client.submitTx()` or `client.submitTxCommit()`, the result includes a numeric `code` field. A code of `0` means the transaction was accepted and executed successfully. Any non-zero code is an `ExecError` returned by the exchange engine, indicating precisely why the transaction was rejected. The SDK provides two helpers in `src/errors.ts` to translate these codes into structured information.
+
+## TxResult and code semantics
+
+```typescript
+interface TxResult {
+  code: number;    // 0 = success; non-zero = ExecError code
+  hash: string;    // transaction hash (hex)
+  height?: number; // block height (populated after DeliverTx)
+  log?: string;    // human-readable message (populated on error)
+  events?: TxEvent[];
+}
+```
+
+Code `0` means the engine accepted and applied the transaction. A non-zero code means the action was evaluated but rejected — the state was not mutated (except for nonce advancement). The `log` field usually contains the engine's `Display` message for the error.
+
+## Decoding error codes
+
+```typescript
+import { decodeExecError, execErrorName } from "@proof/trading-sdk";
+
+// Returns ExecErrorInfo | null  (null for code 0 and unknown codes)
+const info = decodeExecError(r.code);
+// { name: "InsufficientMargin", description: "post-trade equity below initial margin requirement" }
+
+// Returns just the stable variant name string
+const name = execErrorName(r.code);
+// "InsufficientMargin"  — or "Ok" for code 0, "UnknownError" for unrecognised codes
+```
+
+The `ExecErrorInfo` interface:
+
+```typescript
+interface ExecErrorInfo {
+  name: string;        // Rust variant name — stable, machine-readable
+  description: string; // one-line human-readable message, suitable for toasts
+}
+```
+
+## Error handling pattern
+
+```typescript
+import { decodeExecError } from "@proof/trading-sdk";
+
+const r = await client.submitTx({
+  type: "PlaceOrder",
+  data: { /* ... */ },
+});
+
+if (r.code !== 0) {
+  const err = decodeExecError(r.code);
+
+  if (r.code === 21) {
+    // TimestampNonceRejected — transient; the SDK advances the nonce automatically.
+    // Simply retry the same action.
+    const retried = await client.submitTx({ type: "PlaceOrder", data: { /* ... */ } });
+    return retried;
+  }
+
+  throw new Error(
+    `${err?.name ?? "UnknownError"} (code ${r.code}): ${err?.description ?? r.log}`
+  );
+}
+```
+
+<Note>
+  **Most common codes to handle explicitly:**
+
+  - **12 `InsufficientMargin`** — the post-trade account equity would fall below the initial margin requirement. Check `account.balance`, open position sizes, and your order's notional before retrying.
+  - **17 `InvalidSignature`** — the Ed25519 signature is invalid. This usually means a mismatched private key, a wrong chain ID, or a payload encoding bug. Do not retry automatically.
+  - **21 `TimestampNonceRejected`** — the sequence timestamp fell outside the engine's replay window or collided with a previously accepted nonce. Safe to retry immediately; the SDK auto-advances the nonce on the next call.
+  - **34 `PostOnlyWouldCross`** — a post-only limit order would have matched against a resting order on placement. Either remove `postOnly: true` or adjust the price to not cross the current best opposite side.
+</Note>
+
+## Complete error code table
+
+| Code | Name | Description |
+|---|---|---|
+| 0 | *(success)* | Transaction accepted and applied. |
+| 1 | `DecodeError` | Transaction decode error. |
+| 2 | `OrderNotFound` | Order not found. |
+| 3 | `NotOwner` | Not the owner of the order. |
+| 4 | `UnauthorizedOracle` | Unauthorized oracle signer. |
+| 5 | `Overflow` | Arithmetic overflow. |
+| 6 | `InvalidPrice` | Invalid price. |
+| 7 | `InvalidQuantity` | Invalid quantity. |
+| 8 | `InvalidSide` | Invalid side. |
+| 9 | `UnknownMarket` | Unknown market. |
+| 10 | `StateCorruption` | Engine state corruption. |
+| 11 | `InsufficientBalance` | Insufficient balance. |
+| 12 | `InsufficientMargin` | Post-trade equity below initial margin requirement. |
+| 13 | `UnauthorizedRelayer` | Unauthorized relayer signer. |
+| 14 | `WithdrawalNotFound` | Withdrawal not found. |
+| 15 | `WithdrawalAlreadyProcessed` | Withdrawal already processed. |
+| 16 | `DuplicateDeposit` | Duplicate deposit signature (replay protection). |
+| 17 | `InvalidSignature` | Invalid Ed25519 signature. |
+| 18 | `SignatureRequired` | Signed (V2) envelope required. |
+| 19 | `AgentNotAuthorized` | Signer is not the owner or an authorized agent. |
+| 20 | `AgentCannotWithdraw` | Agent wallets cannot perform withdrawals. |
+| 21 | `TimestampNonceRejected` | Timestamp nonce failed replay-window validation — sign a fresh envelope. |
+| 22 | `MarketAlreadyExists` | Market already exists. |
+| 23 | `InvalidMarketConfig` | Invalid market configuration. |
+| 24 | `ImpactMarketAlreadyExists` | Impact market already exists. |
+| 25 | `ImpactMarketNotFound` | Impact market not found. |
+| 26 | `MarketClosedForTrading` | Order on a CP/binary book whose parent impact market is resolved or voided. |
+| 27 | `BinaryPriceOutOfRange` | Prediction-binary order price outside the \[0, 1,000,000\] (= $1) range. |
+| 28 | `InvalidResolution` | `ResolveEvent` rejected — invalid outcome for current state. |
+| 29 | `PositionLimitExceeded` | Fill would push the taker's net position past `MarketConfig.maxPositionSize`. |
+| 30 | `OracleTimestampNotMonotonic` | `OracleUpdate` `publishTimeMs` must be strictly greater than the last accepted update (audit B3). |
+| 31 | `TooManyActiveImpactMarkets` | Account would touch more impact markets than the scenario margin engine can enumerate (cap = 4). |
+| 32 | `SettlementPriceMismatch` | Net-delta margin grouping found legs of the same group with disagreeing settle prices (upstream data corruption). |
+| 33 | `OracleNotApplicable` | `OracleUpdate` targets a market kind that doesn't take oracle prices (impact-family children mark off the book). |
+| 34 | `PostOnlyWouldCross` | Post-only order would have crossed the book — rejected to preserve maker semantics. |
+| 35 | `ReduceOnlyWouldIncrease` | Reduce-only order would have increased the position rather than reducing it. |
+| 36 | `TestActionRejected` | Test/admin action rejected (unauthorized signer or engine not configured to accept them). |
+| 37 | `StaleOracle` | Oracle for this market is older than `MarketConfig.markPriceMaxOracleAgeMs`; order placement, margin, and liquidation refuse to use a stale oracle (BE-33). |
+| 38 | `UserLeverageBelowMarketIm` | `SetUserMarketLeverage` rejected: `userImBps` below `market.imBps`. The engine only allows users to deleverage (more margin), never the other direction (BE-16). |
+| 39 | `TickSizeViolation` | `PlaceOrder` price is not a multiple of `MarketConfig.tickSize` (BE-48). |
+| 40 | `LotSizeViolation` | `PlaceOrder`/`MarketOrder` quantity is not a multiple of `MarketConfig.lotSize` (BE-48). |
+| 41 | `OracleStaleNotElapsed` | Fallback oracle signer published before the primary's staleness window elapsed (BE-50). |
+| 42 | `FeeBpsOutOfRange` | Fee bps value outside the \[0, 10,000\] basis-point range. |
+| 43 | `FeeOverrideStaleSeq` | Fee override rejected — seq not strictly greater than last accepted. |
+| 44 | `ClientOrderIdNotFound` | Cancel-by-client-order-id rejected because no active resting order exists for that owner/`clientOrderId` pair. |
+| 45 | `DuplicateClientOrderId` | Place order rejected because an active resting order already uses that owner/`clientOrderId` pair. |
+| 46 | `InvalidClientOrderId` | `clientOrderId` 0 is reserved for absent IDs in exchange events; submit a positive 64-bit value. |
+| 47 | `FillOrKillWouldNotFill` | FOK place order rejected because visible crossing liquidity could not fill the whole order immediately. |
+| 48 | `InvalidCancelReplaceTarget` | Cancel-replace rejected because exactly one of `cancelOrderId` or `cancelClientOrderId` must be supplied. |
+| 255 | `InternalError` | Unexpected runtime failure. |
+
+## Gateway HTTP error codes
+
+Some errors are returned by the **API gateway** before the transaction reaches the engine, as HTTP status codes rather than `TxResult.code` values:
+
+| HTTP Status | Meaning | Action |
+|---|---|---|
+| `401 Unauthorized` | Missing or invalid API key. The request did not include a valid `Authorization: Bearer <token>` header, or the key has been revoked. | Check your `apiKey` in `ExchangeClientOptions`. |
+| `429 Too Many Requests` | Rate limit exceeded. The gateway caps submission throughput per API key. | Implement exponential back-off and retry after the `Retry-After` header duration. |
+
+Gateway errors surface as thrown `Error` objects from `submitTx()` / `submitTxCommit()` rather than as `TxResult` values. Wrap calls in a try/catch to handle both error surfaces:
+
+```typescript
+try {
+  const r = await client.submitTx(action);
+  if (r.code !== 0) {
+    const err = decodeExecError(r.code);
+    console.error(`Engine error ${r.code} (${err?.name}): ${err?.description}`);
+  }
+} catch (e) {
+  // HTTP-level error from the gateway (401, 429, network failure, etc.)
+  console.error("Gateway error:", e);
+}
+```

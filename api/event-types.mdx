@@ -1,0 +1,774 @@
+---
+title: "Exchange Event Types Delivered via WebSocket"
+sidebarTitle: "Event Types"
+description: "Reference for every ExchangeEvent variant emitted by the Proof exchange engine and delivered over WebSocket, including field types, units, and handling examples."
+---
+
+The Proof exchange engine emits a stream of strongly-typed events each time state changes — orders fill, positions open and close, funding is applied, and accounts are liquidated. These events are delivered via the WebSocket feed at `wss://api.dev.proof.trade/ws` and surfaced in the SDK through `client.subscribeBlocks`. Every variant belongs to the `ExchangeEvent` discriminated union and is identified by a string `type` field.
+
+<Warning>
+  All string fields in exchange events carry **stringified numbers**, not native numeric types. For example, `price: "6675234"` represents $66,752.34 (integer cents). Parse with `BigInt(event.price)` when arithmetic precision is required.
+</Warning>
+
+---
+
+## ExchangeEvent union type
+
+```typescript
+type ExchangeEvent =
+  | OrderPlacedEvent
+  | OrderCancelledEvent
+  | TradeExecutedEvent
+  | FeesCollectedEvent
+  | DepositedEvent
+  | WithdrawnEvent
+  | PositionUpdatedEvent
+  | PositionClosedEvent
+  | PriceUpdatedEvent
+  | MarketCreatedEvent
+  | AccountLiquidatedEvent
+  | FundingAppliedEvent
+  | FundingSettledEvent
+  | AgentApprovedEvent
+  | AgentRevokedEvent
+  | MarketOrderProcessedEvent
+  | OrderbookLevelUpdatedEvent;
+```
+
+Dispatch on `event.type` to narrow to a specific variant:
+
+```typescript
+const unsub = client.subscribeBlocks((event: ExchangeEvent) => {
+  if (event.type === "TradeExecuted") {
+    const fillPrice = BigInt(event.price);        // cents → bigint
+    const qty       = BigInt(event.quantity);
+    console.log(
+      `Fill on market ${event.market}: ${qty} contracts @ ${fillPrice} cents`,
+      `maker=${event.makerOwner} taker=${event.takerOwner}`
+    );
+  }
+
+  if (event.type === "FundingSettled") {
+    const payment = BigInt(event.payment);
+    console.log(
+      payment >= 0n
+        ? `Received ${payment} µUSDC funding`
+        : `Paid ${-payment} µUSDC funding`
+    );
+  }
+
+  if (event.type === "AccountLiquidated") {
+    console.warn(`Liquidation: owner=${event.owner} market=${event.market}`);
+  }
+});
+
+// Stop listening when done
+unsub();
+```
+
+---
+
+## OrderPlacedEvent
+
+Emitted when a limit order is successfully placed on the order book.
+
+```typescript
+interface OrderPlacedEvent {
+  type: "OrderPlaced";
+  orderId: string;
+  market: string;
+  owner: string;
+  side: string;
+  price: string;
+  quantity: string;
+  clientOrderId: string;
+}
+```
+
+<ResponseField name="type" type='"OrderPlaced"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="orderId" type="string" required>
+  Engine-assigned order ID (stringified integer, monotonically increasing within a market).
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Market identifier as a decimal string.
+</ResponseField>
+
+<ResponseField name="owner" type="string" required>
+  Hex-encoded 20-byte owner address.
+</ResponseField>
+
+<ResponseField name="side" type="string" required>
+  Order side: `"Buy"` or `"Sell"`.
+</ResponseField>
+
+<ResponseField name="price" type="string" required>
+  Limit price in cents with 2 decimal places (e.g., `"6675234"` = $66,752.34).
+</ResponseField>
+
+<ResponseField name="quantity" type="string" required>
+  Order quantity in integer contracts.
+</ResponseField>
+
+<ResponseField name="clientOrderId" type="string" required>
+  Client-assigned order ID, or `"0"` when absent.
+</ResponseField>
+
+---
+
+## OrderCancelledEvent
+
+Emitted when a resting order is cancelled, whether by the user, by a liquidation, or due to a TTL expiry.
+
+```typescript
+interface OrderCancelledEvent {
+  type: "OrderCancelled";
+  orderId: string;
+  market: string;
+  owner: string;
+  reason: string;
+  originalQuantity: string;
+  remainingQuantity: string;
+  filledQuantity: string;
+  clientOrderId: string;
+}
+```
+
+<ResponseField name="type" type='"OrderCancelled"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="orderId" type="string" required>
+  Engine-assigned order ID.
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Market identifier as a decimal string.
+</ResponseField>
+
+<ResponseField name="owner" type="string" required>
+  Hex-encoded 20-byte owner address.
+</ResponseField>
+
+<ResponseField name="reason" type="string" required>
+  Human-readable cancellation reason (e.g., `"user_requested"`, `"liquidation"`, `"ttl_expired"`).
+</ResponseField>
+
+<ResponseField name="originalQuantity" type="string" required>
+  Quantity originally accepted onto the book in integer contracts.
+</ResponseField>
+
+<ResponseField name="remainingQuantity" type="string" required>
+  Quantity still resting at the moment of cancellation.
+</ResponseField>
+
+<ResponseField name="filledQuantity" type="string" required>
+  Cumulative maker quantity filled before cancellation.
+</ResponseField>
+
+<ResponseField name="clientOrderId" type="string" required>
+  Client-assigned order ID, or `"0"` when absent.
+</ResponseField>
+
+---
+
+## TradeExecutedEvent
+
+Emitted when a fill is matched between a maker (resting) order and a taker (crossing) order. One `TradeExecutedEvent` is emitted per individual fill.
+
+```typescript
+interface TradeExecutedEvent {
+  type: "TradeExecuted";
+  fillId: string;
+  market: string;
+  price: string;
+  quantity: string;
+  makerOrderId: string;
+  makerClientOrderId: string;
+  makerOwner: string;
+  makerSide: string;
+  takerOwner: string;
+  takerClientOrderId: string;
+  takerFee: string;
+  makerFee: string;
+}
+```
+
+<ResponseField name="type" type='"TradeExecuted"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="fillId" type="string" required>
+  Unique fill identifier for this specific match.
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Market identifier as a decimal string.
+</ResponseField>
+
+<ResponseField name="price" type="string" required>
+  Execution price in cents (2 decimal places).
+</ResponseField>
+
+<ResponseField name="quantity" type="string" required>
+  Fill quantity in integer contracts.
+</ResponseField>
+
+<ResponseField name="makerOrderId" type="string" required>
+  Engine-assigned order ID of the resting (maker) order.
+</ResponseField>
+
+<ResponseField name="makerClientOrderId" type="string" required>
+  Maker's client-assigned order ID, or `"0"` when absent.
+</ResponseField>
+
+<ResponseField name="makerOwner" type="string" required>
+  Hex-encoded 20-byte address of the maker.
+</ResponseField>
+
+<ResponseField name="makerSide" type="string" required>
+  Side of the maker's order: `"Buy"` or `"Sell"`.
+</ResponseField>
+
+<ResponseField name="takerOwner" type="string" required>
+  Hex-encoded 20-byte address of the taker.
+</ResponseField>
+
+<ResponseField name="takerClientOrderId" type="string" required>
+  Taker's client-assigned order ID, or `"0"` when absent.
+</ResponseField>
+
+<ResponseField name="takerFee" type="string" required>
+  Taker fee in microUSDC. Current engine emits non-negative charges.
+</ResponseField>
+
+<ResponseField name="makerFee" type="string" required>
+  Maker fee in microUSDC. Current engine emits non-negative charges (rebates appear as credits via `FeesCollectedEvent`).
+</ResponseField>
+
+---
+
+## FeesCollectedEvent
+
+Emitted alongside each `TradeExecutedEvent` to provide a per-fill fee summary. Both events arrive in the same block.
+
+```typescript
+interface FeesCollectedEvent {
+  type: "FeesCollected";
+  market: string;
+  takerOwner: string;
+  takerFee: string;
+  makerOwner: string;
+  makerFee: string;
+}
+```
+
+<ResponseField name="type" type='"FeesCollected"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Market identifier as a decimal string.
+</ResponseField>
+
+<ResponseField name="takerOwner" type="string" required>
+  Hex-encoded 20-byte address of the taker.
+</ResponseField>
+
+<ResponseField name="takerFee" type="string" required>
+  Taker fee in microUSDC (signed).
+</ResponseField>
+
+<ResponseField name="makerOwner" type="string" required>
+  Hex-encoded 20-byte address of the maker.
+</ResponseField>
+
+<ResponseField name="makerFee" type="string" required>
+  Maker fee in microUSDC (signed).
+</ResponseField>
+
+---
+
+## DepositedEvent
+
+Emitted when USDC is credited to an account (via `ConfirmDeposit` or the legacy `Deposit` action).
+
+```typescript
+interface DepositedEvent {
+  type: "Deposited";
+  owner: string;
+  amount: string;
+  newBalance: string;
+}
+```
+
+<ResponseField name="type" type='"Deposited"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="owner" type="string" required>
+  Hex-encoded 20-byte owner address.
+</ResponseField>
+
+<ResponseField name="amount" type="string" required>
+  Deposited amount in microUSDC (6 decimal places).
+</ResponseField>
+
+<ResponseField name="newBalance" type="string" required>
+  Account balance after the deposit in microUSDC.
+</ResponseField>
+
+---
+
+## WithdrawnEvent
+
+Emitted when USDC is debited from an account.
+
+```typescript
+interface WithdrawnEvent {
+  type: "Withdrawn";
+  owner: string;
+  amount: string;
+  newBalance: string;
+}
+```
+
+<ResponseField name="type" type='"Withdrawn"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="owner" type="string" required>
+  Hex-encoded 20-byte owner address.
+</ResponseField>
+
+<ResponseField name="amount" type="string" required>
+  Withdrawn amount in microUSDC (6 decimal places).
+</ResponseField>
+
+<ResponseField name="newBalance" type="string" required>
+  Account balance after the withdrawal in microUSDC.
+</ResponseField>
+
+---
+
+## PositionUpdatedEvent
+
+Emitted when a position is opened or when its size or entry price changes due to a fill. Reflects the position state after the mutation.
+
+```typescript
+interface PositionUpdatedEvent {
+  type: "PositionUpdated";
+  owner: string;
+  market: string;
+  side: string;
+  entryPrice: string;
+  size: string;
+}
+```
+
+<ResponseField name="type" type='"PositionUpdated"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="owner" type="string" required>
+  Hex-encoded 20-byte owner address.
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Market identifier as a decimal string.
+</ResponseField>
+
+<ResponseField name="side" type="string" required>
+  Position side: `"Buy"` = long, `"Sell"` = short.
+</ResponseField>
+
+<ResponseField name="entryPrice" type="string" required>
+  Weighted-average entry price in cents (2 decimal places) after the fill.
+</ResponseField>
+
+<ResponseField name="size" type="string" required>
+  Absolute position size in integer contracts after the fill.
+</ResponseField>
+
+---
+
+## PositionClosedEvent
+
+Emitted when a position is fully closed (size reaches zero).
+
+```typescript
+interface PositionClosedEvent {
+  type: "PositionClosed";
+  owner: string;
+  market: string;
+  realizedPnl: string;
+}
+```
+
+<ResponseField name="type" type='"PositionClosed"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="owner" type="string" required>
+  Hex-encoded 20-byte owner address.
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Market identifier as a decimal string.
+</ResponseField>
+
+<ResponseField name="realizedPnl" type="string" required>
+  Realized PnL in microUSDC (signed). Positive = profit, negative = loss.
+</ResponseField>
+
+---
+
+## PriceUpdatedEvent
+
+Emitted when the oracle price is updated for a market.
+
+```typescript
+interface PriceUpdatedEvent {
+  type: "PriceUpdated";
+  market: string;
+  price: string;
+}
+```
+
+<ResponseField name="type" type='"PriceUpdated"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Market identifier as a decimal string.
+</ResponseField>
+
+<ResponseField name="price" type="string" required>
+  New oracle price in cents (2 decimal places).
+</ResponseField>
+
+---
+
+## MarketCreatedEvent
+
+Emitted when a new perpetual market is registered on the exchange.
+
+```typescript
+interface MarketCreatedEvent {
+  type: "MarketCreated";
+  market: string;
+  imBps: string;
+  mmBps: string;
+  takerFeeBps: string;
+  makerFeeBps: string;
+  fundingIntervalMs: string;
+  maxFundingRateBps: string;
+}
+```
+
+<ResponseField name="type" type='"MarketCreated"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Market identifier as a decimal string.
+</ResponseField>
+
+<ResponseField name="imBps" type="string" required>
+  Initial margin requirement in basis points.
+</ResponseField>
+
+<ResponseField name="mmBps" type="string" required>
+  Maintenance margin requirement in basis points.
+</ResponseField>
+
+<ResponseField name="takerFeeBps" type="string" required>
+  Taker fee rate in basis points.
+</ResponseField>
+
+<ResponseField name="makerFeeBps" type="string" required>
+  Maker fee rate in basis points.
+</ResponseField>
+
+<ResponseField name="fundingIntervalMs" type="string" required>
+  Funding payment interval in milliseconds. `"0"` = funding disabled.
+</ResponseField>
+
+<ResponseField name="maxFundingRateBps" type="string" required>
+  Maximum absolute funding rate per interval in basis points.
+</ResponseField>
+
+---
+
+## AccountLiquidatedEvent
+
+Emitted when an account is liquidated because its maintenance margin falls below the required threshold.
+
+```typescript
+interface AccountLiquidatedEvent {
+  type: "AccountLiquidated";
+  owner: string;
+  market: string;
+  side: string;
+  size: string;
+  markPrice: string;
+  realizedPnl: string;
+}
+```
+
+<ResponseField name="type" type='"AccountLiquidated"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="owner" type="string" required>
+  Hex-encoded 20-byte address of the liquidated account.
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Market identifier as a decimal string.
+</ResponseField>
+
+<ResponseField name="side" type="string" required>
+  Side of the liquidated position: `"Buy"` or `"Sell"`.
+</ResponseField>
+
+<ResponseField name="size" type="string" required>
+  Liquidated position size in integer contracts.
+</ResponseField>
+
+<ResponseField name="markPrice" type="string" required>
+  Mark price at the time of liquidation in cents (2 decimal places).
+</ResponseField>
+
+<ResponseField name="realizedPnl" type="string" required>
+  Realized PnL from the liquidation in microUSDC (signed).
+</ResponseField>
+
+---
+
+## FundingAppliedEvent
+
+Emitted once per funding interval when periodic funding is settled across a market. Provides the market-wide funding rate and updated cumulative index.
+
+```typescript
+interface FundingAppliedEvent {
+  type: "FundingApplied";
+  market: string;
+  fundingRateBps: string;
+  cumulativeFunding: string;
+  timestampMs: string;
+}
+```
+
+<ResponseField name="type" type='"FundingApplied"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Market identifier as a decimal string.
+</ResponseField>
+
+<ResponseField name="fundingRateBps" type="string" required>
+  Funding rate for this interval in basis points (signed). Positive = longs pay shorts; negative = shorts pay longs.
+</ResponseField>
+
+<ResponseField name="cumulativeFunding" type="string" required>
+  Cumulative funding index after this application (signed). Used to compute per-position accrued funding.
+</ResponseField>
+
+<ResponseField name="timestampMs" type="string" required>
+  Block timestamp in milliseconds at which funding was applied.
+</ResponseField>
+
+---
+
+## FundingSettledEvent
+
+Emitted once per open position when funding is settled. Follows the market-level `FundingAppliedEvent` in the same block.
+
+```typescript
+interface FundingSettledEvent {
+  type: "FundingSettled";
+  owner: string;
+  market: string;
+  payment: string;
+}
+```
+
+<ResponseField name="type" type='"FundingSettled"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="owner" type="string" required>
+  Hex-encoded 20-byte owner address.
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Market identifier as a decimal string.
+</ResponseField>
+
+<ResponseField name="payment" type="string" required>
+  Funding payment in microUSDC (signed). Positive = received (credit to account), negative = paid (debit from account).
+</ResponseField>
+
+---
+
+## AgentApprovedEvent
+
+Emitted when an owner approves a delegate agent wallet to trade on their behalf. The agent can place and cancel orders but cannot withdraw or move funds.
+
+```typescript
+interface AgentApprovedEvent {
+  type: "AgentApproved";
+  owner: string;
+  agent: string;
+  agentPubkey: string;
+}
+```
+
+<ResponseField name="type" type='"AgentApproved"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="owner" type="string" required>
+  Hex-encoded 20-byte address of the account granting delegation.
+</ResponseField>
+
+<ResponseField name="agent" type="string" required>
+  Hex-encoded 20-byte derived address of the agent wallet.
+</ResponseField>
+
+<ResponseField name="agentPubkey" type="string" required>
+  Hex-encoded 32-byte Ed25519 public key of the agent.
+</ResponseField>
+
+---
+
+## AgentRevokedEvent
+
+Emitted when an owner revokes a previously approved agent wallet.
+
+```typescript
+interface AgentRevokedEvent {
+  type: "AgentRevoked";
+  owner: string;
+  agent: string;
+  agentPubkey: string;
+}
+```
+
+<ResponseField name="type" type='"AgentRevoked"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="owner" type="string" required>
+  Hex-encoded 20-byte address of the account revoking the delegation.
+</ResponseField>
+
+<ResponseField name="agent" type="string" required>
+  Hex-encoded 20-byte derived address of the revoked agent wallet.
+</ResponseField>
+
+<ResponseField name="agentPubkey" type="string" required>
+  Hex-encoded 32-byte Ed25519 public key of the revoked agent.
+</ResponseField>
+
+---
+
+## MarketOrderProcessedEvent
+
+Emitted exactly once at the end of every market-order transaction that passes envelope validation, regardless of how many fills occurred. This is the **authoritative fill-status signal** for market orders.
+
+```typescript
+interface MarketOrderProcessedEvent {
+  type: "MarketOrderProcessed";
+  market: string;
+  owner: string;
+  side: string;
+  requestedQuantity: string;
+  filledQuantity: string;
+  clientOrderId?: string;
+}
+```
+
+Use `filledQuantity` to determine the outcome of your market order:
+
+| Condition | Meaning |
+|---|---|
+| `filledQuantity == requestedQuantity` | Fully filled |
+| `0 < filledQuantity < requestedQuantity` | Partial fill; IOC remainder was dropped |
+| `filledQuantity == "0"` | No fills — no counterparty available, or all were rejected by self-match prevention |
+
+Without this event, callers would need to count downstream `TradeExecutedEvent` emissions and could not distinguish "no counterparty" from "events arrived in a different stream view."
+
+<ResponseField name="type" type='"MarketOrderProcessed"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Market identifier as a decimal string.
+</ResponseField>
+
+<ResponseField name="owner" type="string" required>
+  Hex-encoded 20-byte address of the market order submitter.
+</ResponseField>
+
+<ResponseField name="side" type="string" required>
+  Side of the original market order: `"Buy"` or `"Sell"`.
+</ResponseField>
+
+<ResponseField name="requestedQuantity" type="string" required>
+  Quantity originally requested in integer contracts.
+</ResponseField>
+
+<ResponseField name="filledQuantity" type="string" required>
+  Quantity actually filled before the IOC drop in integer contracts.
+</ResponseField>
+
+<ResponseField name="clientOrderId" type="string">
+  Client-assigned order ID of the IOC, market-order, or close-position request. Absent when no `clientOrderId` was provided.
+</ResponseField>
+
+---
+
+## OrderbookLevelUpdatedEvent
+
+Emitted after every mutation to a price level in the order book. Carries the **absolute** post-mutation state (not a delta), so listeners can maintain a local book snapshot by overwriting the level on every event.
+
+```typescript
+interface OrderbookLevelUpdatedEvent {
+  type: "OrderbookLevelUpdated";
+  market: string;
+  side: string;
+  price: string;
+  totalQuantity: string;
+  orderCount: string;
+}
+```
+
+<ResponseField name="type" type='"OrderbookLevelUpdated"' required>
+  Event discriminator.
+</ResponseField>
+
+<ResponseField name="market" type="string" required>
+  Market identifier as a decimal string.
+</ResponseField>
+
+<ResponseField name="side" type="string" required>
+  Book side: `"Buy"` (bids) or `"Sell"` (asks).
+</ResponseField>
+
+<ResponseField name="price" type="string" required>
+  Price level in microUSDC.
+</ResponseField>
+
+<ResponseField name="totalQuantity" type="string" required>
+  Total resting quantity at this price level after the mutation in integer contracts. A value of `"0"` means the level has been cleared.
+</ResponseField>
+
+<ResponseField name="orderCount" type="string" required>
+  Number of resting orders at this price level after the mutation.
+</ResponseField>

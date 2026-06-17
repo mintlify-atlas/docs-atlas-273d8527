@@ -1,0 +1,881 @@
+---
+title: "ExchangeClient: Submit, Query, and Subscribe"
+sidebarTitle: "ExchangeClient"
+description: "Full API reference for ExchangeClient: key management, transaction submission, market reads, history queries, and real-time WebSocket subscriptions."
+---
+
+`ExchangeClient` is the single entry point for all interactions with the Proof Exchange. It handles Ed25519 key management, timestamp-nonce allocation, chain ID resolution, signed transaction encoding, and every read endpoint exposed by the Go API server and CometBFT RPC layer. Instantiate once, load a private key, and call the appropriate method group.
+
+## Constructor
+
+```typescript
+new ExchangeClient(opts?: ExchangeClientOptions)
+```
+
+Creates a new client instance. All options are optional; the defaults target the public Proof devnet. See [Client Options](/api/client-options) for a full reference.
+
+```typescript
+import { ExchangeClient } from "@proof/trading-sdk";
+
+// Devnet — all defaults
+const client = new ExchangeClient({ chainId: "exchange-devnet-1" });
+
+// Local development stack
+const client = new ExchangeClient({
+  rpcUrl: "http://localhost:26657",
+  apiUrl: "http://localhost:8080",
+  gatewayUrl: "http://localhost:9080",
+  chainId: "proof-dev",
+});
+```
+
+<ParamField body="opts" type="ExchangeClientOptions" optional>
+  Configuration object. When omitted entirely the client targets the Proof devnet at `https://api.dev.proof.trade`. See [Client Options](/api/client-options) for every field.
+</ParamField>
+
+---
+
+## Key Management
+
+Before any transaction can be submitted you must load a private key. The key is stored in memory for the lifetime of the client instance.
+
+### `setPrivateKey`
+
+```typescript
+setPrivateKey(key: Uint8Array): void
+```
+
+Loads a 32-byte Ed25519 private key. Simultaneously derives and caches the public key, 20-byte owner address, and hex-encoded address string.
+
+```typescript
+import { generateKeypair, pubkeyToOwner } from "@proof/trading-sdk";
+
+const { privateKey } = generateKeypair();
+client.setPrivateKey(privateKey);
+```
+
+<ParamField body="key" type="Uint8Array" required>
+  A 32-byte Ed25519 private key scalar.
+</ParamField>
+
+---
+
+### `getAddress`
+
+```typescript
+getAddress(): Uint8Array | null
+```
+
+Returns the cached 20-byte owner address derived from the loaded public key, or `null` if no key has been set.
+
+<ResponseField name="return" type="Uint8Array | null">
+  The 20-byte address as a `Uint8Array`, or `null` before `setPrivateKey` is called.
+</ResponseField>
+
+---
+
+### `getAddressHex`
+
+```typescript
+getAddressHex(): string | null
+```
+
+Returns the hex-encoded owner address (without a `0x` prefix), or `null` if no key has been set. This string is accepted by every query endpoint that takes an `addressHex` parameter.
+
+<ResponseField name="return" type="string | null">
+  Lowercase hex address string (40 characters), or `null` before `setPrivateKey` is called.
+</ResponseField>
+
+---
+
+## Chain
+
+### `ready`
+
+```typescript
+ready(): Promise<void>
+```
+
+Pre-warms the chain ID resolution cache. The client resolves its chain ID lazily on the first `submitTx` call; calling `ready()` at startup surfaces `/status`-fetch errors during initialization rather than mid-flow.
+
+This method is optional — `submitTx` resolves the chain ID automatically — but recommended for production code where you want to fail fast.
+
+```typescript
+const client = new ExchangeClient();
+await client.ready(); // throws here if /status is unreachable
+client.setPrivateKey(privateKey);
+```
+
+---
+
+### `status`
+
+```typescript
+status(): Promise<{ latestHeight: number; latestAppHash: string }>
+```
+
+Fetches the CometBFT `/status` endpoint and returns the latest committed block height and app hash.
+
+```typescript
+const { latestHeight, latestAppHash } = await client.status();
+console.log(`Chain head: block ${latestHeight}`);
+```
+
+<ResponseField name="latestHeight" type="number">
+  The block height of the most recently committed block.
+</ResponseField>
+
+<ResponseField name="latestAppHash" type="string">
+  Hex-encoded application state hash at `latestHeight`.
+</ResponseField>
+
+---
+
+## Transaction Submission
+
+The client exposes two submission modes. Both submit the same V3 signed MessagePack envelope; they differ only in how long they wait and what they return.
+
+### `TxResult`
+
+Every submission method returns a `TxResult`:
+
+```typescript
+interface TxResult {
+  code: number;      // 0 = success; non-zero = ExecError code
+  hash: string;      // Hex-encoded transaction hash (uppercase)
+  height?: number;   // Block height of inclusion (after commit only)
+  log?: string;      // Human-readable error message on failure
+  events?: TxEvent[];// ABCI events emitted by the transaction
+}
+```
+
+<ResponseField name="code" type="number">
+  `0` on success. Non-zero values correspond to ExecError codes from the engine. Common codes:
+
+  | Code | Meaning |
+  |------|---------|
+  | `12` | Insufficient margin |
+  | `17` | Invalid signature |
+  | `21` | Invalid or duplicate timestamp nonce — retry |
+  | `34` | Post-only order would cross |
+  | `401` | Missing or invalid `X-Api-Key` |
+  | `429` | Rate limited by gateway |
+</ResponseField>
+
+<ResponseField name="hash" type="string">
+  Uppercase hex-encoded SHA-256 hash of the raw transaction bytes. Empty string on gateway-level transport failures.
+</ResponseField>
+
+<ResponseField name="height" type="number" optional>
+  Block height at which the transaction was included. Only populated by `submitTxCommit` and the background DeliverTx verifier after inclusion is confirmed.
+</ResponseField>
+
+<ResponseField name="log" type="string" optional>
+  Human-readable error description. Empty on success.
+</ResponseField>
+
+<ResponseField name="events" type="TxEvent[]" optional>
+  ABCI events emitted by the transaction. Only populated after block inclusion (not available from CheckTx).
+</ResponseField>
+
+---
+
+### `submitTx`
+
+```typescript
+submitTx(action: Action): Promise<TxResult>
+```
+
+Signs and broadcasts a transaction, returning as soon as CometBFT's CheckTx (or the gateway) responds. On `code === 0` a background verifier is spawned that polls `/tx?hash=...` for up to 5 seconds to capture the DeliverTx result. Collect those results with `awaitPendingVerifies`.
+
+This is the preferred high-throughput path. The timestamp nonce is allocated automatically.
+
+```typescript
+import { Side } from "@proof/trading-sdk";
+
+const result = await client.submitTx({
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: client.getAddress()!,
+    side: Side.Buy,
+    price: 50_000_000n, // $500,000.00 in cents
+    quantity: 1n,
+    postOnly: true,
+  },
+});
+
+if (result.code !== 0) {
+  console.error(`Order rejected: [${result.code}] ${result.log}`);
+}
+```
+
+<ParamField body="action" type="Action" required>
+  A discriminated-union action object. See [Actions](#action-type) below.
+</ParamField>
+
+<ResponseField name="return" type="Promise<TxResult>">
+  Resolves after CheckTx with `code === 0` for acceptance or a non-zero code for rejection. `height` is not set — use `submitTxCommit` or `awaitPendingVerifies` if you need confirmed inclusion.
+</ResponseField>
+
+---
+
+### `submitTxCommit`
+
+```typescript
+submitTxCommit(action: Action): Promise<TxResult>
+```
+
+Submits a transaction and synchronously polls `/tx?hash=...` until block inclusion is confirmed or the 9-second deadline is reached. Returns the DeliverTx result including `height` and `events`.
+
+Use this when downstream logic depends on the transaction's on-chain effect (e.g. open a position, then immediately query account).
+
+```typescript
+const result = await client.submitTxCommit({
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: client.getAddress()!,
+    side: Side.Sell,
+    price: 65_000_000n,
+    quantity: 2n,
+  },
+});
+
+console.log(`Included at block ${result.height}`);
+```
+
+<ParamField body="action" type="Action" required>
+  A discriminated-union action object.
+</ParamField>
+
+<ResponseField name="return" type="Promise<TxResult>">
+  Resolves with a fully-populated `TxResult` including `height` and `events`. Returns `code: -1` with a timeout log if inclusion is not seen within 9 seconds.
+</ResponseField>
+
+---
+
+### `awaitPendingVerifies`
+
+```typescript
+awaitPendingVerifies(): Promise<TxResult[]>
+```
+
+Waits for all in-flight background DeliverTx verifiers (spawned by prior `submitTx` calls) to settle, then returns the collected results. The internal buffer is drained on each call — subsequent calls return only results that completed after the previous drain.
+
+Call this before issuing a transaction that depends on a previous transaction's state having landed.
+
+```typescript
+// Submit a batch
+for (const order of orders) {
+  await client.submitTx({ type: "PlaceOrder", data: order });
+}
+
+// Wait for all to land
+const deliveryResults = await client.awaitPendingVerifies();
+const failed = deliveryResults.filter((r) => r.code !== 0);
+if (failed.length > 0) {
+  console.warn(`${failed.length} orders failed at inclusion`, failed);
+}
+```
+
+<ResponseField name="return" type="Promise<TxResult[]>">
+  Array of DeliverTx results. Entries with `code !== 0` passed CheckTx but failed at block inclusion and should be logged or retried.
+</ResponseField>
+
+---
+
+### Action Type
+
+`Action` is a discriminated union. Pass the appropriate `type` string and `data` object:
+
+```typescript
+type Action =
+  | { type: "PlaceOrder";         data: PlaceOrder }
+  | { type: "CancelOrder";        data: CancelOrder }
+  | { type: "CancelClientOrder";  data: CancelClientOrder }
+  | { type: "CancelAllOrders";    data: CancelAllOrders }
+  | { type: "CancelReplaceOrder"; data: CancelReplaceOrder }
+  | { type: "AmendOrder";         data: AmendOrder }
+  | { type: "AtomicBasketOrder";  data: AtomicBasketOrder }
+  | { type: "MarketOrder";        data: MarketOrder }
+  | { type: "ClosePosition";      data: ClosePosition }
+  | { type: "WithdrawRequest";    data: WithdrawRequest }
+  | { type: "ApproveAgent";       data: ApproveAgent }
+  | { type: "RevokeAgent";        data: RevokeAgent }
+  // … and more admin/relayer actions — see src/types.ts
+```
+
+Common action examples:
+
+```typescript
+// Limit order
+{ type: "PlaceOrder", data: { market: 1, owner: addr, side: Side.Buy,
+    price: 50_000_000n, quantity: 1n } }
+
+// Market order (crosses immediately)
+{ type: "MarketOrder", data: { market: 1, owner: addr, side: Side.Sell,
+    quantity: 1n } }
+
+// Cancel by engine order ID
+{ type: "CancelOrder", data: { orderId: 42n, owner: addr } }
+
+// Cancel all orders on a market
+{ type: "CancelAllOrders", data: { owner: addr, market: 1 } }
+
+// Close entire position at oracle price
+{ type: "ClosePosition", data: { market: 1, owner: addr } }
+```
+
+---
+
+## Reads
+
+All read methods call the Go API server at `apiUrl`. The `addressHex` parameter is optional on most methods — when omitted the client uses the address derived from the loaded private key.
+
+### `queryOrderbook`
+
+```typescript
+queryOrderbook(market: number): Promise<Orderbook>
+```
+
+Fetches the full order book snapshot for a market, decoded from MessagePack.
+
+```typescript
+const book = await client.queryOrderbook(1);
+console.log(`Best bid: ${book.bids[0]?.price}`);
+console.log(`Best ask: ${book.asks[0]?.price}`);
+```
+
+<ParamField query="market" type="number" required>
+  Integer market identifier (e.g. `1` for BTC-PERP).
+</ParamField>
+
+<ResponseField name="return" type="Promise<Orderbook>">
+  <Expandable title="Orderbook fields">
+    <ResponseField name="bids" type="OrderbookLevel[]">
+      Buy-side levels, sorted best (highest) price first.
+    </ResponseField>
+    <ResponseField name="asks" type="OrderbookLevel[]">
+      Sell-side levels, sorted best (lowest) price first.
+    </ResponseField>
+  </Expandable>
+
+  Each `OrderbookLevel`:
+
+  <Expandable title="OrderbookLevel fields">
+    <ResponseField name="price" type="bigint">
+      Price in integer cents (2 dp). Example: `6675234n` = $66,752.34.
+    </ResponseField>
+    <ResponseField name="totalQty" type="bigint">
+      Total resting quantity at this level in integer contracts.
+    </ResponseField>
+    <ResponseField name="orderCount" type="number">
+      Number of individual resting orders at this price.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+### `queryOpenOrders`
+
+```typescript
+queryOpenOrders(addressHex?: string): Promise<OpenOrder[]>
+```
+
+Returns all resting orders for an account. Returns an empty array if the account has no open orders or if no address is available.
+
+```typescript
+const orders = await client.queryOpenOrders();
+for (const o of orders) {
+  console.log(`Order ${o.id}: ${o.side} ${o.quantity} @ ${o.price} on market ${o.market}`);
+}
+```
+
+<ParamField query="addressHex" type="string" optional>
+  Hex-encoded owner address (40 characters). Defaults to the address derived from the loaded private key.
+</ParamField>
+
+<ResponseField name="return" type="Promise<OpenOrder[]>">
+  <Expandable title="OpenOrder fields">
+    <ResponseField name="id" type="bigint">Engine-assigned order ID, monotonic within the market.</ResponseField>
+    <ResponseField name="market" type="number">Market identifier.</ResponseField>
+    <ResponseField name="owner" type="Uint8Array">20-byte owner address.</ResponseField>
+    <ResponseField name="side" type='"Buy" | "Sell"'>Order side.</ResponseField>
+    <ResponseField name="price" type="bigint">Limit price in integer cents.</ResponseField>
+    <ResponseField name="quantity" type="bigint">Resting quantity in integer contracts.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+### `queryMarkets`
+
+```typescript
+queryMarkets(): Promise<MarketConfig[]>
+```
+
+Returns all registered market configurations. Used to discover market IDs, fee rates, margin requirements, and tick/lot sizes.
+
+```typescript
+const markets = await client.queryMarkets();
+markets.forEach((m) => console.log(`Market ${m.market}: IM=${m.imBps}bps`));
+```
+
+<ResponseField name="return" type="Promise<MarketConfig[]>">
+  <Expandable title="Key MarketConfig fields">
+    <ResponseField name="market" type="number">Unique integer market identifier.</ResponseField>
+    <ResponseField name="imBps" type="number">Initial margin in basis points (e.g. `1000` = 10% = 10× max leverage).</ResponseField>
+    <ResponseField name="mmBps" type="number">Maintenance margin in basis points.</ResponseField>
+    <ResponseField name="takerFeeBps" type="number">Taker fee rate in basis points.</ResponseField>
+    <ResponseField name="makerFeeBps" type="number">Maker fee rate in basis points.</ResponseField>
+    <ResponseField name="fundingIntervalMs" type="bigint">Funding interval in ms. `0` = funding disabled.</ResponseField>
+    <ResponseField name="maxFundingRateBps" type="number">Maximum absolute funding rate per interval in basis points.</ResponseField>
+    <ResponseField name="kind" type="MarketKind" optional>`"Perp"` for perpetuals; structured object for conditional or binary markets.</ResponseField>
+    <ResponseField name="tickSize" type="bigint" optional>Minimum price increment in µUSDC. `0` = no gate.</ResponseField>
+    <ResponseField name="lotSize" type="bigint" optional>Minimum quantity increment in contracts. `0` = no gate.</ResponseField>
+    <ResponseField name="ticker" type="string" optional>Human-readable symbol, e.g. `"BTC"`.</ResponseField>
+    <ResponseField name="feeTiers" type="FeeTier[]" optional>Volume-based fee tier table. Empty = flat fees.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+### `queryAccount`
+
+```typescript
+queryAccount(addressHex?: string): Promise<AccountInfo | null>
+```
+
+Fetches full account state: balance, open positions with margin enrichments, equity, and margin requirements. Returns `null` if no address is available.
+
+```typescript
+const acct = await client.queryAccount();
+if (acct) {
+  const usdcBalance = Number(acct.balance) / 1e6;
+  console.log(`Balance: $${usdcBalance.toFixed(2)}`);
+  console.log(`Equity:  $${(Number(acct.equity) / 1e6).toFixed(2)}`);
+  console.log(`Positions: ${acct.positions.length}`);
+}
+```
+
+<ParamField query="addressHex" type="string" optional>
+  Hex-encoded owner address. Defaults to the address derived from the loaded private key.
+</ParamField>
+
+<ResponseField name="return" type="Promise<AccountInfo | null>">
+  <Expandable title="AccountInfo fields">
+    <ResponseField name="balance" type="bigint">Available USDC balance in µUSDC (6 dp). Example: `100_000_000_000n` = $100,000.</ResponseField>
+    <ResponseField name="positions" type="PositionInfo[]">Open positions. See PositionInfo below.</ResponseField>
+    <ResponseField name="equity" type="bigint">Total equity (balance + unrealized PnL) in µUSDC. Scenario-aware: worst-case across all resolution outcomes.</ResponseField>
+    <ResponseField name="totalMm" type="bigint">Total maintenance margin requirement in µUSDC.</ResponseField>
+    <ResponseField name="totalIm" type="bigint">Total initial margin requirement in µUSDC.</ResponseField>
+    <ResponseField name="marginRatioBps" type="bigint">Margin ratio in basis points (equity / total notional × 10,000).</ResponseField>
+    <ResponseField name="bindingScenario" type="BindingScenarioEntry[]" optional>Resolution scenario that maximizes total MM — the "binding" outcome. One entry per active impact market. Empty for perp-only accounts.</ResponseField>
+    <ResponseField name="feesAccrued" type="bigint" optional>Cumulative trading fees paid (positive) or rebates received (negative) in µUSDC.</ResponseField>
+    <ResponseField name="volume30dMicroUsdc" type="bigint" optional>Rolling 30-day taker volume in µUSDC at the account's last volume update.</ResponseField>
+  </Expandable>
+
+  <Expandable title="PositionInfo fields">
+    <ResponseField name="owner" type="Uint8Array">20-byte owner address.</ResponseField>
+    <ResponseField name="market" type="number">Market identifier.</ResponseField>
+    <ResponseField name="side" type='"Buy" | "Sell"'>`"Buy"` = long, `"Sell"` = short.</ResponseField>
+    <ResponseField name="entryPrice" type="bigint">Weighted-average entry price in integer cents.</ResponseField>
+    <ResponseField name="size" type="bigint">Absolute position size in integer contracts.</ResponseField>
+    <ResponseField name="lastFundingIndex" type="bigint">Cumulative funding index at the last settlement.</ResponseField>
+    <ResponseField name="upnlNow" type="bigint" optional>Unrealized PnL at the current mark in µUSDC.</ResponseField>
+    <ResponseField name="mmNow" type="bigint" optional>Maintenance margin contribution for this position in µUSDC.</ResponseField>
+    <ResponseField name="imNow" type="bigint" optional>Initial margin contribution for this position in µUSDC.</ResponseField>
+    <ResponseField name="pnlIfFires" type="bigint" optional>Position value if its branch fires (µ = 1).</ResponseField>
+    <ResponseField name="pnlIfDies" type="bigint" optional>Position value if its branch does not fire (µ = 0).</ResponseField>
+    <ResponseField name="fundingSince" type="bigint" optional>Funding accrued since the last settlement. Positive = credit, negative = debit.</ResponseField>
+    <ResponseField name="adlScore" type="bigint" optional>Auto-deleveraging queue score. Higher = closer to the front of the ADL queue.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+### `queryTicker`
+
+```typescript
+queryTicker(market: number): Promise<Ticker | null>
+```
+
+Returns a one-round-trip market summary bundling 24-hour statistics, funding data, and top-of-book in a single response. Returns `null` for unknown market IDs.
+
+```typescript
+const ticker = await client.queryTicker(1);
+if (ticker) {
+  console.log(`Last: ${ticker.lastPrice}`);
+  console.log(`24h vol (contracts): ${ticker.volume24hContracts}`);
+  console.log(`24h change (bps): ${ticker.change24hBps}`);
+}
+```
+
+<ParamField query="market" type="number" required>
+  Integer market identifier.
+</ParamField>
+
+<ResponseField name="return" type="Promise<Ticker | null>">
+  <Expandable title="Ticker fields">
+    <ResponseField name="market" type="string">Market ID as a decimal string.</ResponseField>
+    <ResponseField name="lastPrice" type="string">Last fill price in the 24-hour window. `"0"` if no trades.</ResponseField>
+    <ResponseField name="volume24hContracts" type="string">Sum of fill quantities over the 24-hour window in integer contracts.</ResponseField>
+    <ResponseField name="change24hBps" type="string">Signed 24-hour price change in basis points.</ResponseField>
+    <ResponseField name="fundingMsgpackB64" type="string">Base64 MessagePack-encoded `FundingInfo` blob (mark EWMA, oracle, funding rate). Decode with `@msgpack/msgpack`.</ResponseField>
+    <ResponseField name="orderbookMsgpackB64" type="string">Base64 MessagePack-encoded top-of-book snapshot at depth 1.</ResponseField>
+    <ResponseField name="openInterest" type="string | null">Always `null` — the engine does not track open interest yet. Render as `"—"` in UI.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+### `queryHealth`
+
+```typescript
+queryHealth(): Promise<{ status: string; height: number }>
+```
+
+Checks the health of the API server. Useful as a liveness probe.
+
+```typescript
+const health = await client.queryHealth();
+console.log(health); // { status: "ok", height: 12345 }
+```
+
+<ResponseField name="status" type="string">Server health status string (e.g. `"ok"`).</ResponseField>
+<ResponseField name="height" type="number">Latest block height seen by the API server.</ResponseField>
+
+---
+
+### `queryAdlQueue`
+
+```typescript
+queryAdlQueue(market: number): Promise<AdlQueueEntry[]>
+```
+
+Returns the auto-deleveraging queue for a market — profitable positions sorted by `adlScore` descending (highest-risk first). Use the position's rank index divided by the total entry count to compute a per-position ADL percentile.
+
+```typescript
+const queue = await client.queryAdlQueue(1);
+const myEntry = queue.find((e) =>
+  e.owner.toString() === client.getAddress()?.toString()
+);
+if (myEntry) {
+  const percentile = (queue.indexOf(myEntry) / queue.length) * 100;
+  console.log(`ADL percentile: ${percentile.toFixed(0)}%`);
+}
+```
+
+<ParamField query="market" type="number" required>
+  Integer market identifier.
+</ParamField>
+
+<ResponseField name="return" type="Promise<AdlQueueEntry[]>">
+  <Expandable title="AdlQueueEntry fields">
+    <ResponseField name="owner" type="Uint8Array">20-byte owner address.</ResponseField>
+    <ResponseField name="market" type="number">Market identifier.</ResponseField>
+    <ResponseField name="side" type='"Buy" | "Sell"'>Position side.</ResponseField>
+    <ResponseField name="size" type="bigint">Position size in integer contracts.</ResponseField>
+    <ResponseField name="upnlNow" type="bigint">Unrealized PnL at current mark in µUSDC. Always positive (only profitable positions are queued).</ResponseField>
+    <ResponseField name="adlScore" type="bigint">`max(0, upnlNow) × leverage_bps`. Higher = closer to the front of the queue.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+### `queryWithdrawal`
+
+```typescript
+queryWithdrawal(id: bigint): Promise<WithdrawalRecord | null>
+```
+
+Looks up a withdrawal record by its engine-assigned ID. Returns `null` for unknown IDs (the engine encodes "not found" as MessagePack `nil`, not HTTP 404).
+
+```typescript
+const record = await client.queryWithdrawal(7n);
+if (record) {
+  console.log(`Status: ${record.status}`); // "Pending" | "Completed" | "Failed"
+  console.log(`Amount: ${record.amount} µUSDC`);
+}
+```
+
+<ParamField query="id" type="bigint" required>
+  Engine-assigned withdrawal ID, obtained from a prior `WithdrawRequest` result or history query.
+</ParamField>
+
+<ResponseField name="return" type="Promise<WithdrawalRecord | null>">
+  <Expandable title="WithdrawalRecord fields">
+    <ResponseField name="id" type="bigint">Engine-assigned withdrawal ID.</ResponseField>
+    <ResponseField name="owner" type="Uint8Array">20-byte address that requested the withdrawal.</ResponseField>
+    <ResponseField name="amount" type="bigint">Withdrawal amount in µUSDC.</ResponseField>
+    <ResponseField name="solanaDestination" type="Uint8Array">32-byte Solana destination public key.</ResponseField>
+    <ResponseField name="status" type='"Pending" | "Completed" | "Failed"'>Current lifecycle status. Transitions are one-way.</ResponseField>
+    <ResponseField name="requestHeight" type="bigint">Block height at which the withdrawal request was admitted.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## History
+
+History endpoints return chronological event logs for an account, newest first. All time filter parameters are Unix millisecond timestamps.
+
+### `queryHistoryDeposits`
+
+```typescript
+queryHistoryDeposits(
+  addressHex?: string,
+  opts?: { fromMs?: number; toMs?: number; limit?: number }
+): Promise<HistoryCashFlow[]>
+```
+
+Returns every `deposit_confirmed` event for an address, newest first.
+
+```typescript
+const deposits = await client.queryHistoryDeposits(undefined, {
+  fromMs: Date.now() - 7 * 24 * 60 * 60 * 1000, // last 7 days
+  limit: 50,
+});
+```
+
+<ParamField query="addressHex" type="string" optional>Hex-encoded owner address. Defaults to the loaded key's address.</ParamField>
+<ParamField query="opts.fromMs" type="number" optional>Start of the time window as a Unix millisecond timestamp. Unbounded when omitted.</ParamField>
+<ParamField query="opts.toMs" type="number" optional>End of the time window as a Unix millisecond timestamp. Unbounded when omitted.</ParamField>
+<ParamField query="opts.limit" type="number" optional>Maximum number of rows to return. Server-side cap is 1,000.</ParamField>
+
+<ResponseField name="return" type="Promise<HistoryCashFlow[]>">
+  See [HistoryCashFlow fields](#historycashflow-fields) below.
+</ResponseField>
+
+---
+
+### `queryHistoryWithdrawals`
+
+```typescript
+queryHistoryWithdrawals(
+  addressHex?: string,
+  opts?: { fromMs?: number; toMs?: number; limit?: number }
+): Promise<HistoryCashFlow[]>
+```
+
+Returns the withdrawal lifecycle log for an address — covering `withdraw_requested`, `withdrawal_confirmed`, and `withdrawal_failed` events, newest first. Filter by `kind` client-side to show only pending requests.
+
+<ParamField query="addressHex" type="string" optional>Hex-encoded owner address. Defaults to the loaded key's address.</ParamField>
+<ParamField query="opts.fromMs" type="number" optional>Start of the time window (Unix ms). Unbounded when omitted.</ParamField>
+<ParamField query="opts.toMs" type="number" optional>End of the time window (Unix ms). Unbounded when omitted.</ParamField>
+<ParamField query="opts.limit" type="number" optional>Maximum rows to return. Server-side cap is 1,000.</ParamField>
+
+<ResponseField name="return" type="Promise<HistoryCashFlow[]>">
+  See [HistoryCashFlow fields](#historycashflow-fields) below.
+</ResponseField>
+
+#### HistoryCashFlow fields
+
+<Expandable title="HistoryCashFlow fields">
+  <ResponseField name="kind" type='"deposit_confirmed" | "withdraw_requested" | "withdrawal_confirmed" | "withdrawal_failed"'>
+    The event kind that generated this row.
+  </ResponseField>
+  <ResponseField name="owner" type="string">20-byte owner address as a hex string.</ResponseField>
+  <ResponseField name="amount" type="string">Amount in µUSDC (always positive). May be empty for `withdrawal_confirmed`.</ResponseField>
+  <ResponseField name="signedDelta" type="string">Signed balance delta: positive for `deposit_confirmed` and `withdrawal_failed`; negative for `withdraw_requested`; `"0"` for `withdrawal_confirmed`.</ResponseField>
+  <ResponseField name="newBalance" type="string">Post-event balance in µUSDC. Empty for `withdrawal_confirmed`.</ResponseField>
+  <ResponseField name="withdrawalId" type="string">Present on withdrawal events only.</ResponseField>
+  <ResponseField name="solanaTxSig" type="string">Solana transaction signature. Present on `deposit_confirmed` and `withdrawal_confirmed`.</ResponseField>
+  <ResponseField name="solanaDestination" type="string">Destination Solana address. Present on `withdraw_requested` only.</ResponseField>
+  <ResponseField name="reason" type="string">Failure reason. Present on `withdrawal_failed` only.</ResponseField>
+  <ResponseField name="blockHeight" type="number">Block height at which the event landed.</ResponseField>
+  <ResponseField name="timestamp" type="number">Unix millisecond timestamp.</ResponseField>
+</Expandable>
+
+---
+
+### `queryHistoryResolutions`
+
+```typescript
+queryHistoryResolutions(
+  addressHex?: string,
+  opts?: {
+    impactMarketId?: number;
+    fromMs?: number;
+    toMs?: number;
+    limit?: number;
+  }
+): Promise<HistoryResolution[]>
+```
+
+Returns per-user position-at-resolution rows — one entry per settlement or voided-conditional snapshot. Feeds the Portfolio "Resolved" tab.
+
+<ParamField query="addressHex" type="string" optional>Hex-encoded owner address. Defaults to the loaded key's address.</ParamField>
+<ParamField query="opts.impactMarketId" type="number" optional>Filter to a specific impact-market family ID.</ParamField>
+<ParamField query="opts.fromMs" type="number" optional>Start of the time window (Unix ms).</ParamField>
+<ParamField query="opts.toMs" type="number" optional>End of the time window (Unix ms).</ParamField>
+<ParamField query="opts.limit" type="number" optional>Maximum rows to return. Server-side cap is 1,000.</ParamField>
+
+<ResponseField name="return" type="Promise<HistoryResolution[]>">
+  <Expandable title="HistoryResolution fields">
+    <ResponseField name="kind" type='"conditional_settled" | "conditional_voided" | "prediction_settled"'>Resolution event kind.</ResponseField>
+    <ResponseField name="impactMarketId" type="string">Impact-market family ID.</ResponseField>
+    <ResponseField name="market" type="string">Child market ID (CPY/CPN or EBY/EBN).</ResponseField>
+    <ResponseField name="owner" type="string">20-byte owner address as hex.</ResponseField>
+    <ResponseField name="side" type="string">`"Buy"` = long, `"Sell"` = short.</ResponseField>
+    <ResponseField name="size" type="string">Position size at resolution in integer lots.</ResponseField>
+    <ResponseField name="entryPrice" type="string">Weighted-average entry price.</ResponseField>
+    <ResponseField name="settlementPrice" type="string">Settlement price. Empty for `conditional_voided`.</ResponseField>
+    <ResponseField name="realizedPnl" type="string">Signed realized PnL in µUSDC. `"0"` for `conditional_voided`.</ResponseField>
+    <ResponseField name="blockHeight" type="number">Block height at which the resolution landed.</ResponseField>
+    <ResponseField name="timestamp" type="number">Unix millisecond timestamp.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+### `queryHistoryPositions`
+
+```typescript
+queryHistoryPositions(
+  addressHex?: string,
+  opts?: {
+    market?: number;
+    fromMs?: number;
+    toMs?: number;
+    limit?: number;
+  }
+): Promise<HistoryPositionSnapshot[]>
+```
+
+Returns point-in-time position snapshots written after each fill that changes a position. A row with `size === "0"` is a close event. Results are newest first.
+
+```typescript
+const snapshots = await client.queryHistoryPositions(undefined, {
+  market: 1,
+  limit: 100,
+});
+const closes = snapshots.filter((s) => s.size === "0");
+console.log(`${closes.length} closed positions on market 1`);
+```
+
+<ParamField query="addressHex" type="string" optional>Hex-encoded owner address. Defaults to the loaded key's address.</ParamField>
+<ParamField query="opts.market" type="number" optional>Filter to a specific market ID.</ParamField>
+<ParamField query="opts.fromMs" type="number" optional>Start of the time window (Unix ms).</ParamField>
+<ParamField query="opts.toMs" type="number" optional>End of the time window (Unix ms).</ParamField>
+<ParamField query="opts.limit" type="number" optional>Maximum rows to return. Server-side cap is 5,000.</ParamField>
+
+<ResponseField name="return" type="Promise<HistoryPositionSnapshot[]>">
+  <Expandable title="HistoryPositionSnapshot fields">
+    <ResponseField name="owner" type="string">20-byte owner address as hex.</ResponseField>
+    <ResponseField name="market" type="string">Market ID as a decimal string.</ResponseField>
+    <ResponseField name="side" type="string">`"Buy"` = long, `"Sell"` = short.</ResponseField>
+    <ResponseField name="entryPrice" type="string">Weighted-average entry price in µUSDC at snapshot time.</ResponseField>
+    <ResponseField name="size" type="string">Absolute position size in contracts. `"0"` = closed.</ResponseField>
+    <ResponseField name="blockHeight" type="number">Block height at which the snapshot landed.</ResponseField>
+    <ResponseField name="timestamp" type="number">Unix millisecond timestamp.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## Blocks
+
+Direct CometBFT RPC block accessors. These fetch raw JSON-RPC results and return them unmodified.
+
+### `getBlock`
+
+```typescript
+getBlock(height?: number): Promise<Record<string, unknown>>
+```
+
+Fetches a block from the CometBFT RPC. When `height` is omitted, returns the latest committed block.
+
+```typescript
+const latest = await client.getBlock();
+const specific = await client.getBlock(12345);
+```
+
+<ParamField query="height" type="number" optional>
+  Block height to fetch. Omit for the latest block.
+</ParamField>
+
+<ResponseField name="return" type="Promise<Record<string, unknown>>">
+  Raw CometBFT `block` result object. Contains `block.header`, `block.data.txs`, and related fields.
+</ResponseField>
+
+---
+
+### `getBlockResults`
+
+```typescript
+getBlockResults(height: number): Promise<Record<string, unknown>>
+```
+
+Fetches ABCI results for a specific block — the per-transaction DeliverTx outcomes including events.
+
+```typescript
+const results = await client.getBlockResults(12345);
+```
+
+<ParamField query="height" type="number" required>
+  Block height to fetch results for. Unlike `getBlock`, a height is required.
+</ParamField>
+
+<ResponseField name="return" type="Promise<Record<string, unknown>>">
+  Raw CometBFT `block_results` object. Contains `txs_results`, `begin_block_events`, `end_block_events`, and `consensus_param_updates`.
+</ResponseField>
+
+---
+
+## Events
+
+### `subscribeBlocks`
+
+```typescript
+subscribeBlocks(
+  onEvent: (event: Record<string, unknown>) => void
+): () => void
+```
+
+Opens a WebSocket connection to the CometBFT node (at `wsUrl`) and delivers `NewBlock` and `Tx` events to the callback. The connection reconnects automatically with exponential backoff (2s → 4s → … capped at 60s with ±25% jitter) if it closes unexpectedly.
+
+Multiple calls register multiple listeners on the same underlying socket. Returns an unsubscribe function that removes the specific listener; the socket is kept open while any listener remains.
+
+```typescript
+const unsubscribe = client.subscribeBlocks((event) => {
+  const type = (event as { type?: string }).type;
+
+  if (type === "TradeExecuted") {
+    console.log("Trade:", event);
+  }
+
+  if (type === "NewBlock") {
+    const block = event as { value?: { block?: { header?: { height?: string } } } };
+    console.log("New block:", block.value?.block?.header?.height);
+  }
+});
+
+// Later, remove this listener:
+unsubscribe();
+```
+
+<ParamField body="onEvent" type="(event: Record<string, unknown>) => void" required>
+  Callback invoked for every `NewBlock` and `Tx` event received over the WebSocket. The `event` object is the `result.data` field of the CometBFT subscription message.
+</ParamField>
+
+<ResponseField name="return" type="() => void">
+  An unsubscribe function. Call it to remove this listener. If no listeners remain after unsubscribing, the WebSocket reconnect timer is left active until `disconnect()` is called.
+</ResponseField>
+
+---
+
+### `disconnect`
+
+```typescript
+disconnect(): void
+```
+
+Closes the WebSocket connection and cancels any pending reconnect timer. Call this when the client instance is no longer needed to avoid background reconnection loops.
+
+```typescript
+// Clean up on shutdown
+client.disconnect();
+```

@@ -1,0 +1,265 @@
+---
+title: "Rust SDK Core for the Proof Exchange"
+sidebarTitle: "Rust"
+description: "Reference for the proof-trading-sdk Rust crate: public modules, Signer trait, LocalSigner, workspace layout, codec internals, and build instructions."
+---
+
+The `proof-trading-sdk` crate is the audited foundation that backs every Proof Exchange SDK surface. The Python PyO3 bindings call into it directly; the TypeScript SDK uses the same wire format enforced by its codec. Internal tools, custom market-making bots, and Rust services that want direct access to the same signing and encoding logic — without an HTTP gateway in between — should depend on this crate.
+
+<Note>
+Most external developers should use the [TypeScript SDK](/sdks/typescript) or [Python SDK](/sdks/python). Reach for the Rust crate when you are building a Rust service, writing a custom relayer, or need to embed signing logic in a binary without a language runtime.
+</Note>
+
+## Crate location
+
+```
+crates/proof-trading-sdk/
+```
+
+The crate lives inside the `trading-sdk` Cargo workspace. Add it to your project's `Cargo.toml` as a path or git dependency:
+
+```toml
+[dependencies]
+proof-trading-sdk = { path = "../crates/proof-trading-sdk" }
+```
+
+---
+
+## Workspace layout
+
+The workspace (`Cargo.toml` at the repository root) contains four crates:
+
+```toml
+[workspace]
+members = [
+    "crates/proof-trading-sdk",
+    "crates/proof-trading-sdk-derive",
+    "crates/proof-trading-sdk-pyo3",
+    "crates/spec",
+]
+resolver = "2"
+```
+
+| Crate | Purpose |
+|---|---|
+| `proof-trading-sdk` | Core signing, codec, and wire types — the crate documented here |
+| `proof-trading-sdk-derive` | Proc-macro helpers used internally by the core crate |
+| `proof-trading-sdk-pyo3` | PyO3 extension module (`_native`) that wraps the core for Python |
+| `spec` | Golden-vector fixtures and cross-binding compatibility tests |
+
+---
+
+## Public modules
+
+From `src/lib.rs`:
+
+```rust
+pub mod codec;
+pub mod crypto;
+pub mod signer;
+pub mod types;
+pub mod wire;
+```
+
+| Module | Contents |
+|---|---|
+| `codec` | `Action` enum, `encode_signed_tx`, `sign_and_encode_with_chain`, `decode_tx`, `peek_action_type`, `get_action_types`, envelope constants |
+| `crypto` | `signing_message`, `verify_signature`, `pubkey_to_owner`, `chainIdFromString`, `UNBOUND_CHAIN_ID` |
+| `signer` | `Signer` trait, `LocalSigner`, `SignerError` |
+| `types` | All action payload structs (`PlaceOrder`, `CancelOrder`, `OracleUpdate`, …) and domain types |
+| `wire` | `Address`, `Pubkey`, and other fixed-length byte-array newtypes with length-checked decoding |
+
+---
+
+## `Signer` trait
+
+The `signer` module provides an open trait for pluggable key custody. The codec path accepts any `impl Signer`, so you can swap in an HSM, a cloud KMS, or a remote signer without touching the encoding logic.
+
+```rust
+pub trait Signer: Send + Sync {
+    /// The 32-byte Ed25519 public key for this signer.
+    fn public_key(&self) -> [u8; 32];
+
+    /// Sign `msg`, returning the 64-byte detached Ed25519 signature.
+    fn try_sign(&self, msg: &[u8]) -> Result<[u8; 64], SignerError>;
+}
+```
+
+`Send + Sync` is required so handles can be shared across threads; backends that wrap non-thread-safe device sessions should use a `Mutex` internally.
+
+### `SignerError`
+
+```rust
+pub enum SignerError {
+    /// The backend (device / HSM / remote service) failed to sign.
+    Backend(String),
+    /// The backend returned a signature of the wrong length (expected 64).
+    InvalidSignatureLength(usize),
+}
+```
+
+### `LocalSigner`
+
+The built-in in-process signer. The private key lives in Rust-owned memory and is zeroized on drop (`ed25519_dalek::SigningKey` is `ZeroizeOnDrop`).
+
+```rust
+use proof_trading_sdk::signer::LocalSigner;
+
+// Build from a 32-byte Ed25519 seed.
+// The caller's copy of `seed` should be zeroized after this returns.
+let signer = LocalSigner::from_bytes(&seed);
+
+let pubkey: [u8; 32] = signer.public_key();
+let signature: [u8; 64] = signer.try_sign(&message)?;
+```
+
+Use `LocalSigner` when the key is loaded from a file descriptor or environment at startup. For keys that must never reside in process memory, implement `Signer` against your HSM or KMS client.
+
+---
+
+## Codec
+
+### Wire envelope
+
+Every transaction is a 6-element MessagePack fixarray:
+
+```
+[version=2, action_type, seq, payload_bytes, pubkey, signature]
+```
+
+- `version` is always `2` (the only accepted value today).
+- `payload_bytes` is a msgpack `bin` blob (not an array).
+- `pubkey` is 32 bytes; `signature` is 64 bytes.
+- `seq` is a `u64` millisecond Unix timestamp used as a replay-protection nonce.
+
+### Signing message
+
+Signatures bind to a specific chain via the `ProofExchange-v3` domain prefix:
+
+```
+signing_message = "ProofExchange-v3" || chain_id[32] || action_type[1] || seq[8-LE] || payload
+```
+
+The domain version (`v3`) is independent of the envelope version (`2`). The chain-ID binding closes the cross-chain replay vector — an UNBOUND signature (all-zero chain ID) is accepted only on deployments that have not set a real chain ID.
+
+### Key codec functions
+
+```rust
+use proof_trading_sdk::codec::{
+    sign_and_encode_with_chain,
+    encode_signed_tx,
+    decode_tx,
+    peek_action_type,
+    get_action_types,
+    ENVELOPE_VERSION,
+};
+
+// Sign and encode a typed Action
+let wire_bytes = sign_and_encode_with_chain(
+    &chain_id,   // [u8; 32]
+    &action,     // &Action
+    seq,         // u64 nonce
+    &signing_key, // &ed25519_dalek::SigningKey
+)?;
+
+// Decode wire bytes into a typed Action + auth metadata
+let decoded = decode_tx(&wire_bytes)?;
+println!("{:?}", decoded.action);
+println!("seq={}, pubkey={:?}", decoded.seq, decoded.auth.pubkey);
+
+// Cheap action-type inspection without full decode
+let action_type: Option<u8> = peek_action_type(&wire_bytes);
+
+// Full action-type manifest (generated by the same macro as encode/decode)
+for (name, code) in get_action_types() {
+    println!("{name} = {code:#04x}");
+}
+```
+
+### Action type bytes
+
+The `impl_action_encoding!` macro is the single source of truth for all action-type discriminants:
+
+| Action | Byte |
+|---|---|
+| `PlaceOrder` | `0x01` |
+| `CancelOrder` | `0x02` |
+| `OracleUpdate` | `0x03` |
+| `MarketOrder` | `0x04` |
+| `Deposit` | `0x05` |
+| `Withdraw` | `0x06` |
+| `CreateMarket` | `0x07` |
+| `WithdrawRequest` | `0x08` |
+| `ConfirmDeposit` | `0x09` |
+| `ConfirmWithdrawal` | `0x0A` |
+| `FailWithdrawal` | `0x0B` |
+| `ApproveAgent` | `0x0C` |
+| `RevokeAgent` | `0x0D` |
+| `CreateImpactMarket` | `0x0E` |
+| `ResolveEvent` | `0x0F` |
+| `UpdateMarketFees` | `0x10` |
+| `SetUserMarketLeverage` | `0x16` |
+| `ClosePosition` | `0x17` |
+| `CancelClientOrder` | `0x18` |
+| `CancelAllOrders` | `0x19` |
+| `CancelReplaceOrder` | `0x1A` |
+| `AmendOrder` | `0x1B` |
+| `AtomicBasketOrder` | `0x1C` |
+
+### Integer encoding and TypeScript parity
+
+The Rust codec uses `rmp-serde` with **minimal-int encoding**: every integer is packed into the smallest msgpack integer type that fits its value. A `u64` field holding `100` is encoded as a 1-byte positive fixint, not as a full 8-byte uint64. This is intentional and matches the TypeScript SDK's `minimizeBigInts` logic in `codec.ts`. If you construct envelopes with a different encoder and use fixed-width integers, the bytes will not match the golden vectors in `crates/spec/`.
+
+---
+
+## Building and testing
+
+```bash
+# Build all workspace crates
+cargo build
+
+# Run the full test suite (includes golden-vector and stress tests)
+cargo test
+
+# Build only the core crate
+cargo build -p proof-trading-sdk
+
+# Run tests for the core crate only
+cargo test -p proof-trading-sdk
+```
+
+The `crates/spec/` crate contains golden-vector hex fixtures (`place_order.hex`, `cancel_order.hex`, `oracle_update.hex`) that the codec tests verify against. Any change to the wire format that causes a golden-vector mismatch is a breaking change.
+
+---
+
+## Implementing a custom `Signer`
+
+```rust
+use proof_trading_sdk::signer::{Signer, SignerError};
+
+struct MyHsmSigner {
+    // your HSM session / key reference
+}
+
+impl Signer for MyHsmSigner {
+    fn public_key(&self) -> [u8; 32] {
+        // fetch the public key from the HSM
+        todo!()
+    }
+
+    fn try_sign(&self, msg: &[u8]) -> Result<[u8; 64], SignerError> {
+        // ask the HSM to sign `msg`; map its error to SignerError::Backend
+        todo!()
+    }
+}
+```
+
+Once you have an `impl Signer`, build the signing message yourself with `crypto::signing_message` and pass the resulting signature bytes to `codec::encode_signed_tx`:
+
+```rust
+use proof_trading_sdk::{codec, crypto};
+
+let msg = crypto::signing_message(&chain_id, action_type, seq, &payload_bytes);
+let sig = my_signer.try_sign(&msg)?;
+let wire = codec::encode_signed_tx(&action, seq, &my_signer.public_key(), &sig)?;
+```

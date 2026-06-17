@@ -1,0 +1,164 @@
+---
+title: "Key Management and Address Derivation in Proof"
+sidebarTitle: "Key Management"
+description: "Generate Ed25519 keypairs, derive 20-byte owner addresses with keccak256, convert between hex and bytes, and bind keys to a chain ID."
+---
+
+Every account on the Proof Exchange is identified by a 20-byte **owner address** derived deterministically from an Ed25519 public key. The SDK ships all the primitives you need — key generation, address derivation, hex conversion, and chain-ID binding — in `src/crypto.ts`. No external wallet infrastructure is required; you can generate a fully functional trading key in a single function call.
+
+## Generating a keypair
+
+`generateKeypair()` uses `@noble/ed25519` to create a cryptographically secure 32-byte private key and the corresponding 32-byte public key:
+
+```typescript
+import { generateKeypair } from "@proof/trading-sdk";
+
+const { publicKey, privateKey } = generateKeypair();
+// publicKey  → Uint8Array (32 bytes)
+// privateKey → Uint8Array (32 bytes)
+```
+
+<Warning>
+  Never log, serialize to disk in plain text, or transmit the `privateKey`. Treat it with the same care as a wallet seed phrase. If a private key is exposed, rotate it immediately by approving a new agent wallet (`ApproveAgent`) and revoking the old one (`RevokeAgent`).
+</Warning>
+
+## Deriving an owner address
+
+The 20-byte owner address is the last 20 bytes of `keccak256(publicKey)` — the same derivation used by the Rust engine's `pubkey_to_owner`:
+
+```typescript
+import { generateKeypair, pubkeyToOwner, ownerToHex } from "@proof/trading-sdk";
+
+const { publicKey, privateKey } = generateKeypair();
+
+// keccak256(publicKey)[12..32] → 20-byte Uint8Array
+const address = pubkeyToOwner(publicKey);
+
+// Convert to 40-char lowercase hex for display or API calls
+const addressHex = ownerToHex(address);
+console.log(`0x${addressHex}`);
+```
+
+The derivation is defined in `src/crypto.ts` as:
+
+```typescript
+export function pubkeyToOwner(pubkey: Uint8Array): Uint8Array {
+  const hash = keccak_256(pubkey);
+  return hash.slice(12, 32); // last 20 bytes of the 32-byte keccak digest
+}
+```
+
+## Hex conversion helpers
+
+Two helpers convert between the 20-byte `Uint8Array` address and its hex string representation:
+
+```typescript
+import { ownerToHex, hexToBytes } from "@proof/trading-sdk";
+
+// Uint8Array → hex string (no "0x" prefix)
+const hex = ownerToHex(address); // e.g. "a1b2c3...f0"
+
+// hex string → Uint8Array (accepts optional "0x" prefix)
+const bytes = hexToBytes("0xa1b2c3...f0");
+```
+
+Action payloads (e.g. the `owner` field of `PlaceOrder`) accept the raw `Uint8Array`; use `hexToBytes` when you receive an address as a string from an API response.
+
+## Loading a key into the client
+
+After generating or loading a private key, register it with `ExchangeClient`. The client derives the public key and owner address internally, making them available through `getAddress()` and `getAddressHex()`:
+
+```typescript
+import {
+  ExchangeClient,
+  generateKeypair,
+  pubkeyToOwner,
+  ownerToHex,
+} from "@proof/trading-sdk";
+
+const { publicKey, privateKey } = generateKeypair();
+
+const client = new ExchangeClient({ chainId: "exchange-devnet-1" });
+client.setPrivateKey(privateKey);
+
+// Retrieve the derived address at any time:
+const addressBytes = client.getAddress();    // Uint8Array | null
+const addressHex   = client.getAddressHex(); // string | null (no "0x" prefix)
+```
+
+<Note>
+  `getAddress()` returns `null` until `setPrivateKey()` has been called. Always check for `null` before using the address in an action payload.
+</Note>
+
+## Complete key generation + address derivation example
+
+```typescript
+import {
+  ExchangeClient,
+  Side,
+  generateKeypair,
+  pubkeyToOwner,
+  ownerToHex,
+} from "@proof/trading-sdk";
+
+// 1. Generate a fresh keypair
+const { publicKey, privateKey } = generateKeypair();
+
+// 2. Derive and display the owner address
+const address    = pubkeyToOwner(publicKey);
+const addressHex = ownerToHex(address);
+console.log(`New address: 0x${addressHex}`);
+
+// 3. Attach to the client
+const client = new ExchangeClient({ chainId: "exchange-devnet-1" });
+client.setPrivateKey(privateKey);
+
+// 4. The client now signs all submitTx calls with this key automatically
+const result = await client.submitTx({
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: address,      // 20-byte Uint8Array
+    side: Side.Buy,
+    price: 6675234n,     // $66,752.34 in cents
+    quantity: 1n,
+  },
+});
+
+console.log(result.code === 0 ? "Order placed" : `Error: ${result.log}`);
+```
+
+## Chain ID binding
+
+The v3 signing envelope includes a 32-byte **chain ID** that prevents a signature created for one deployment from being replayed on another. The SDK hashes the CometBFT `chain_id` string with keccak256 to produce this binding:
+
+```typescript
+import { chainIdFromString, UNBOUND_CHAIN_ID } from "@proof/trading-sdk";
+
+// Production: derive from the CometBFT chain_id string
+const chainId = chainIdFromString("exchange-devnet-1"); // Uint8Array (32 bytes)
+
+// UNBOUND_CHAIN_ID is an all-zero 32-byte constant — only for offline/unit tests
+// NEVER use it in production; signatures are trivially replayable on any
+// other zero-chain_id deployment.
+console.log(UNBOUND_CHAIN_ID); // Uint8Array(32) [0, 0, 0, ..., 0]
+```
+
+`ExchangeClient` resolves and caches the chain ID automatically when `chainId` is passed to the constructor (or auto-fetches it from the CometBFT `/status` endpoint). When calling `signAndEncode()` directly you must supply the correct `chainId` yourself.
+
+<Tip>
+  Pin the `chainId` string explicitly in `ExchangeClient` options for fully deterministic, reproducible signatures across builds. Without it, the client makes a network call to `/status` on first use, which can fail in air-gapped or CI environments.
+</Tip>
+
+## Domain prefix
+
+All signing messages are prefixed with the 16-byte ASCII string `ProofExchange-v3`. This domain separator was bumped from `v2` on 2026-04-23 (audit finding B4) when the envelope gained the 32-byte `chain_id` binding. A v2-signed transaction submitted to a v3 engine fails signature verification because the message bytes are different — providing protection against cross-chain and post-wipe replay attacks.
+
+```
+Signing message layout (v3):
+  ProofExchange-v3  (16 bytes, ASCII)
+  chain_id          (32 bytes, keccak256 of CometBFT chain_id string)
+  action_type       (1 byte)
+  seq               (8 bytes, big-endian u64)
+  payload           (variable, MessagePack-encoded action fields)
+```

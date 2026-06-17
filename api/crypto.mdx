@@ -1,0 +1,325 @@
+---
+title: "Crypto Primitives: Ed25519 Signing and Address Derivation"
+sidebarTitle: "Crypto"
+description: "Ed25519 keypair generation, address derivation, hex helpers, and V3 signing-message construction backed by @noble/ed25519 and @noble/hashes."
+---
+
+Every transaction on the Proof Exchange is authenticated by an Ed25519 signature, and every account address is a 20-byte slice of a keccak256 digest. The `crypto` module exposes the complete set of primitives you need to generate keys, derive addresses, build deterministic signing messages, and verify signatures — all in a form that is byte-for-byte compatible with the Rust `crypto.rs` reference implementation. These functions are the foundation on which the codec and the `ExchangeClient` are built; you will need them directly whenever you sign offline or integrate a custom key-management backend.
+
+## Key Management
+
+### `generateKeypair()`
+
+Generates a fresh Ed25519 keypair using `@noble/ed25519`'s cryptographically secure `utils.randomSecretKey()`.
+
+```typescript
+import { generateKeypair } from "@proof/trading-sdk";
+
+const { privateKey, publicKey } = generateKeypair();
+// privateKey — 32-byte random secret scalar
+// publicKey  — 32-byte compressed Ed25519 point
+```
+
+<ResponseField name="privateKey" type="Uint8Array">
+  32-byte random Ed25519 secret key. Keep this secret and never transmit it.
+</ResponseField>
+<ResponseField name="publicKey" type="Uint8Array">
+  32-byte compressed Ed25519 public key derived from `privateKey`.
+</ResponseField>
+
+---
+
+### `getPublicKey(privateKey)`
+
+Deterministically derives the 32-byte Ed25519 public key from a private key.
+
+```typescript
+import { getPublicKey } from "@proof/trading-sdk";
+
+const publicKey = getPublicKey(privateKey); // Uint8Array (32 bytes)
+```
+
+<ParamField path="privateKey" type="Uint8Array" required>
+  32-byte Ed25519 secret key.
+</ParamField>
+
+<ResponseField name="return" type="Uint8Array">
+  32-byte Ed25519 public key.
+</ResponseField>
+
+---
+
+## Address Derivation
+
+On Proof Exchange, an account's owner address is the last 20 bytes of the keccak256 hash of its Ed25519 public key — the same derivation used by the Rust `pubkey_to_owner` function.
+
+### `pubkeyToOwner(pubkey)`
+
+Derives the 20-byte owner address from a 32-byte Ed25519 public key via `keccak256(pubkey)[12..32]`.
+
+```typescript
+import { generateKeypair, pubkeyToOwner, ownerToHex } from "@proof/trading-sdk";
+
+const { privateKey, publicKey } = generateKeypair();
+const owner = pubkeyToOwner(publicKey); // Uint8Array (20 bytes)
+const hex   = ownerToHex(owner);        // "a1b2c3..." (40 hex chars)
+```
+
+<ParamField path="pubkey" type="Uint8Array" required>
+  32-byte Ed25519 public key.
+</ParamField>
+
+<ResponseField name="return" type="Uint8Array">
+  20-byte owner address. Equivalent to `keccak256(pubkey).slice(12, 32)`.
+</ResponseField>
+
+---
+
+### `ownerToHex(owner)`
+
+Converts a 20-byte owner address to its lowercase hexadecimal string representation (no `0x` prefix).
+
+```typescript
+import { ownerToHex } from "@proof/trading-sdk";
+
+const hex = ownerToHex(owner); // "a1b2c3d4..." (40 characters)
+```
+
+<ParamField path="owner" type="Uint8Array" required>
+  20-byte owner address, typically produced by `pubkeyToOwner`.
+</ParamField>
+
+<ResponseField name="return" type="string">
+  40-character lowercase hex string with no `0x` prefix.
+</ResponseField>
+
+---
+
+## Hex Utilities
+
+### `hexToBytes(hex)`
+
+Parses a hex string into a `Uint8Array`. Accepts strings with or without a `0x` prefix.
+
+```typescript
+import { hexToBytes } from "@proof/trading-sdk";
+
+const a = hexToBytes("deadbeef");     // Uint8Array [0xde, 0xad, 0xbe, 0xef]
+const b = hexToBytes("0xdeadbeef");   // identical
+```
+
+<ParamField path="hex" type="string" required>
+  Hex-encoded string, optionally prefixed with `0x`. Length must be even.
+</ParamField>
+
+<ResponseField name="return" type="Uint8Array">
+  Raw bytes decoded from the hex string.
+</ResponseField>
+
+---
+
+### `bytesToHex(bytes)`
+
+Encodes a `Uint8Array` as a lowercase hex string with no `0x` prefix.
+
+```typescript
+import { bytesToHex } from "@proof/trading-sdk";
+
+const hex = bytesToHex(new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+// "deadbeef"
+```
+
+<ParamField path="bytes" type="Uint8Array" required>
+  Byte array to encode.
+</ParamField>
+
+<ResponseField name="return" type="string">
+  Lowercase hex string. Two characters per input byte, no prefix.
+</ResponseField>
+
+---
+
+## Chain ID Helpers
+
+### `chainIdFromString(chainId)`
+
+Hashes a CometBFT chain ID string into the 32-byte binding used by the V3 signing envelope. Matches `chain_id_from_string` in Rust `crypto.rs` byte-for-byte.
+
+```typescript
+import { chainIdFromString } from "@proof/trading-sdk";
+
+const chainId = chainIdFromString("proof-mainnet-1");
+// Uint8Array (32 bytes) — keccak256("proof-mainnet-1")
+```
+
+The exchange API exposes the canonical chain ID string via `GET /info`. Use [`fetchChainId`](/api/codec#fetchChainId) to retrieve and cache it automatically.
+
+<ParamField path="chainId" type="string" required>
+  UTF-8 CometBFT chain ID string, e.g. `"proof-mainnet-1"`.
+</ParamField>
+
+<ResponseField name="return" type="Uint8Array">
+  32-byte `keccak256` digest of the UTF-8 encoded chain ID string.
+</ResponseField>
+
+---
+
+### `UNBOUND_CHAIN_ID`
+
+A constant `Uint8Array` of 32 zero bytes representing an unbound chain. **Never submit transactions signed with `UNBOUND_CHAIN_ID` to a production deployment** — signatures are trivially replayable across any chain that shares a zero chain binding.
+
+```typescript
+import { UNBOUND_CHAIN_ID } from "@proof/trading-sdk";
+
+// UNBOUND_CHAIN_ID is new Uint8Array(32) — all zeros
+// Safe to use in unit tests and offline conformance checks only
+```
+
+<Warning>
+  `UNBOUND_CHAIN_ID` is exported as a mutable `Uint8Array` for backward compatibility. Treat it as readonly — mutating it will corrupt every subsequent use in the same process.
+</Warning>
+
+---
+
+## Signing
+
+### `signingMessage(chainId, actionType, seq, payload)`
+
+Constructs the deterministic byte sequence that is signed (and later verified) for every transaction. The V3 layout is:
+
+```
+DOMAIN_PREFIX (16 B) || chain_id (32 B) || action_type (1 B) || seq_be (8 B) || payload
+```
+
+The domain prefix is the UTF-8 encoding of `"ProofExchange-v3"` (16 bytes). This separator was introduced on 2026-04-23 (audit finding B4) when the envelope gained the 32-byte chain ID binding, protecting against cross-chain and post-wipe replay attacks.
+
+```typescript
+import {
+  signingMessage,
+  chainIdFromString,
+  hexToBytes,
+} from "@proof/trading-sdk";
+
+const chainId = chainIdFromString("proof-mainnet-1");
+const msg = signingMessage(
+  chainId,
+  0x01,          // ActionType.PlaceOrder
+  BigInt(Date.now()),
+  payloadBytes,
+);
+```
+
+<ParamField path="chainId" type="Uint8Array" required>
+  32-byte chain ID. Must be exactly 32 bytes — the function throws if the length differs. Use `chainIdFromString` or `UNBOUND_CHAIN_ID` (tests only).
+</ParamField>
+
+<ParamField path="actionType" type="number" required>
+  Single-byte action type wire value from the `ActionType` constant object (e.g. `0x01` for `PlaceOrder`).
+</ParamField>
+
+<ParamField path="seq" type="bigint" required>
+  Monotonically increasing sequence number encoded as a big-endian unsigned 64-bit integer (8 bytes). Typically `BigInt(Date.now())`.
+</ParamField>
+
+<ParamField path="payload" type="Uint8Array" required>
+  MessagePack-encoded action payload bytes, as produced by `encodePayloadBytes`.
+</ParamField>
+
+<ResponseField name="return" type="Uint8Array">
+  Complete signing message: `16 + 32 + 1 + 8 + payload.length` bytes.
+</ResponseField>
+
+---
+
+### `sign(privateKey, message)`
+
+Signs an arbitrary message with an Ed25519 private key using `@noble/ed25519`. The library requires `sha512` to be injected synchronously — `crypto.ts` handles this automatically at import time.
+
+```typescript
+import { sign, generateKeypair } from "@proof/trading-sdk";
+
+const { privateKey } = generateKeypair();
+const signature = sign(privateKey, message); // Uint8Array (64 bytes)
+```
+
+<ParamField path="privateKey" type="Uint8Array" required>
+  32-byte Ed25519 secret key.
+</ParamField>
+
+<ParamField path="message" type="Uint8Array" required>
+  Raw bytes to sign. Pass the output of `signingMessage` for transaction signing.
+</ParamField>
+
+<ResponseField name="return" type="Uint8Array">
+  64-byte Ed25519 signature `(R || S)`.
+</ResponseField>
+
+---
+
+### `verify(publicKey, signature, message)`
+
+Verifies an Ed25519 signature against a public key and message.
+
+```typescript
+import { verify } from "@proof/trading-sdk";
+
+const valid = verify(publicKey, signature, message); // true | false
+```
+
+<ParamField path="publicKey" type="Uint8Array" required>
+  32-byte Ed25519 public key of the signer.
+</ParamField>
+
+<ParamField path="signature" type="Uint8Array" required>
+  64-byte Ed25519 signature to verify.
+</ParamField>
+
+<ParamField path="message" type="Uint8Array" required>
+  Original message bytes that were signed.
+</ParamField>
+
+<ResponseField name="return" type="boolean">
+  `true` if the signature is valid for the given public key and message; `false` otherwise.
+</ResponseField>
+
+---
+
+## Full Offline Signing Example
+
+```typescript
+import {
+  generateKeypair,
+  pubkeyToOwner,
+  ownerToHex,
+  chainIdFromString,
+  signingMessage,
+  sign,
+  verify,
+  UNBOUND_CHAIN_ID,
+} from "@proof/trading-sdk";
+
+// 1. Generate a keypair (store privateKey securely)
+const { privateKey, publicKey } = generateKeypair();
+
+// 2. Derive the on-chain owner address
+const owner = pubkeyToOwner(publicKey);
+console.log("Owner address:", ownerToHex(owner));
+
+// 3. Build and sign a message (normally handled by signAndEncode)
+const chainId  = chainIdFromString("proof-mainnet-1");
+const msg      = signingMessage(chainId, 0x01, BigInt(Date.now()), payloadBytes);
+const sig      = sign(privateKey, msg);
+
+// 4. Verify (optional — the exchange re-verifies on receipt)
+console.assert(verify(publicKey, sig, msg), "Signature must be valid");
+```
+
+---
+
+## Underlying Libraries
+
+| Library | Purpose |
+|---|---|
+| `@noble/ed25519` | Ed25519 keypair generation, signing (`sign`), and verification (`verify`). V3 requires `hashes.sha512` to be injected — `crypto.ts` does this at module load time. |
+| `@noble/hashes/sha3` | `keccak_256` used by `pubkeyToOwner` and `chainIdFromString`. |
+| `@noble/hashes/sha2` | `sha512` injected into `@noble/ed25519`'s synchronous hash hook. |

@@ -1,0 +1,193 @@
+---
+title: "Delegate Trading Authority with Agent Wallets"
+sidebarTitle: "Agent Wallets"
+description: "Approve a hot-wallet Ed25519 keypair to trade on your behalf while your owner key stays cold — agents can place and cancel orders but cannot withdraw funds."
+---
+
+An agent wallet is a second Ed25519 keypair whose public key you register against your owner account. Once approved, the agent can sign and submit `PlaceOrder`, `CancelOrder`, `CancelAllOrders`, and any other trading action on your behalf — but the engine enforces a hard separation: agents can never withdraw funds or move balances. This lets you keep your owner private key cold (or in a hardware store) while running an automated trading bot with a hot key that can only affect open positions and orders.
+
+## What agents can and cannot do
+
+| Capability | Owner | Agent |
+|---|---|---|
+| Place / cancel orders | ✅ | ✅ |
+| Set leverage overrides | ✅ | ✅ |
+| Close positions | ✅ | ✅ |
+| Submit `WithdrawRequest` | ✅ | ❌ error code 20 |
+| Submit `Deposit` / `Withdraw` (relayer) | ✅ | ❌ error code 20 |
+| Approve or revoke other agents | ✅ | ❌ error code 19 |
+
+Error code `19` (`AgentNotAuthorized`) is returned when the envelope signer is neither the account owner nor an approved agent for that owner. Error code `20` (`AgentCannotWithdraw`) is returned when an approved agent attempts any withdrawal action.
+
+## Action types
+
+Both `ApproveAgent` and `RevokeAgent` are signed by the **owner** key and carry the agent's 32-byte Ed25519 public key:
+
+```typescript
+// From src/types.ts
+
+/** Approve a delegate keypair ("agent wallet") to trade on the owner's behalf. */
+export interface ApproveAgent {
+  /** Account address granting the delegation (20 bytes). */
+  owner: Address;
+  /** Ed25519 public key of the agent wallet (32 bytes). */
+  agentPubkey: Uint8Array; // 32 bytes
+}
+
+/** Revoke a previously approved agent wallet. */
+export interface RevokeAgent {
+  /** Account address revoking the delegation (20 bytes). */
+  owner: Address;
+  /** Ed25519 public key of the agent wallet to revoke (32 bytes). */
+  agentPubkey: Uint8Array; // 32 bytes
+}
+```
+
+## Events
+
+The engine emits these events on successful approval and revocation:
+
+```typescript
+// From src/types.ts
+
+/** Emitted when an agent wallet is approved for delegation. */
+export interface AgentApprovedEvent {
+  type: "AgentApproved";
+  /** Hex-encoded owner address. */
+  owner: string;
+  /** Hex-encoded agent address (derived from agentPubkey via keccak256(pubkey)[12..32]). */
+  agent: string;
+  /** Hex-encoded Ed25519 public key of the agent (32 bytes). */
+  agentPubkey: string;
+}
+
+/** Emitted when an agent wallet delegation is revoked. */
+export interface AgentRevokedEvent {
+  type: "AgentRevoked";
+  /** Hex-encoded owner address. */
+  owner: string;
+  /** Hex-encoded agent address. */
+  agent: string;
+  /** Hex-encoded Ed25519 public key of the agent (32 bytes). */
+  agentPubkey: string;
+}
+```
+
+The `agent` field in both events is the 20-byte address derived from the agent's public key using `keccak256(pubkey)[12..32]` — the same derivation as `pubkeyToOwner()` in `src/crypto.ts`.
+
+## Full workflow
+
+### Step 1 — Generate an agent keypair
+
+```typescript
+import {
+  generateKeypair,
+  pubkeyToOwner,
+  ownerToHex,
+} from "@proof/trading-sdk";
+
+const agentKeypair = generateKeypair();
+// agentKeypair.privateKey → Uint8Array (32 bytes) — store securely in your bot
+// agentKeypair.publicKey  → Uint8Array (32 bytes) — safe to share publicly
+```
+
+### Step 2 — Submit `ApproveAgent` from the owner's key
+
+```typescript
+import { ExchangeClient } from "@proof/trading-sdk";
+
+// Owner client — signed with the cold owner key
+const ownerClient = new ExchangeClient({ chainId: "exchange-devnet-1" });
+ownerClient.setPrivateKey(ownerPrivateKey);
+
+const ownerAddress = ownerClient.getAddress(); // Uint8Array (20 bytes)
+
+const approveResult = await ownerClient.submitTx({
+  type: "ApproveAgent",
+  data: {
+    owner: ownerAddress,
+    agentPubkey: agentKeypair.publicKey, // 32 bytes
+  },
+});
+
+if (approveResult.code !== 0) {
+  throw new Error(`ApproveAgent failed: code=${approveResult.code} log=${approveResult.log}`);
+}
+// Engine emits AgentApprovedEvent — the agent is now authorized
+```
+
+### Step 3 — Trade with the agent key
+
+Create a separate client loaded with the agent's private key. Trading actions must specify the **owner's** address in the `owner` field — the agent signs the envelope, but the action targets the owner's account.
+
+```typescript
+// Agent client — signed with the hot agent key
+const agentClient = new ExchangeClient({ chainId: "exchange-devnet-1" });
+agentClient.setPrivateKey(agentKeypair.privateKey);
+
+// The action's `owner` field must be the OWNER's address, not the agent's
+const orderResult = await agentClient.submitTx({
+  type: "PlaceOrder",
+  data: {
+    market: 1,
+    owner: ownerAddress,   // ← owner's address
+    side: Side.Buy,
+    price: 50000000n,       // $500,000.00 in cents
+    quantity: 1n,
+  },
+});
+
+if (orderResult.code !== 0) {
+  throw new Error(`PlaceOrder failed: code=${orderResult.code} log=${orderResult.log}`);
+}
+```
+
+<Note>
+  The agent signs the transaction **envelope** (the outer MessagePack wrapper with
+  the public key and Ed25519 signature), but every action's `owner` field must
+  carry the **owner's** 20-byte address. The engine uses the envelope signer's
+  derived address to look up the agent authorization list for that owner; if the
+  signer is not on that list, it returns error code `19`.
+</Note>
+
+### Step 4 — Revoke the agent when done
+
+```typescript
+// Back to the owner client — only the owner can revoke
+const revokeResult = await ownerClient.submitTx({
+  type: "RevokeAgent",
+  data: {
+    owner: ownerAddress,
+    agentPubkey: agentKeypair.publicKey, // same public key used in ApproveAgent
+  },
+});
+
+if (revokeResult.code !== 0) {
+  throw new Error(`RevokeAgent failed: code=${revokeResult.code} log=${revokeResult.log}`);
+}
+// Engine emits AgentRevokedEvent — the agent can no longer submit actions
+```
+
+## Listening for agent events
+
+You can confirm delegation status by subscribing to block events:
+
+```typescript
+const unsub = ownerClient.subscribeBlocks((event) => {
+  if (event.type === "AgentApproved") {
+    console.log("Agent authorized:", event.agent, "for owner:", event.owner);
+  }
+  if (event.type === "AgentRevoked") {
+    console.log("Agent revoked:", event.agent);
+    unsub();
+  }
+});
+```
+
+## Error reference
+
+| Code | Name | When it occurs |
+|---|---|---|
+| `19` | `AgentNotAuthorized` | Envelope signer is not the owner and not an approved agent for the `owner` field in the action |
+| `20` | `AgentCannotWithdraw` | An approved agent attempts `WithdrawRequest`, `Withdraw`, or any other fund-movement action |
+| `17` | `InvalidSignature` | The envelope Ed25519 signature does not verify against the embedded public key |
