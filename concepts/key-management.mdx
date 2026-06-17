@@ -1,5 +1,5 @@
 ---
-title: "Key Management and Address Derivation in Proof"
+title: "Key Management and Address Derivation in Proof SDK"
 sidebarTitle: "Key Management"
 description: "Generate Ed25519 keypairs, derive 20-byte owner addresses with keccak256, convert between hex and bytes, and bind keys to a chain ID."
 ---
@@ -50,16 +50,55 @@ export function pubkeyToOwner(pubkey: Uint8Array): Uint8Array {
 
 ## Hex conversion helpers
 
-Two helpers convert between the 20-byte `Uint8Array` address and its hex string representation:
+Four helpers convert between raw bytes and their hex string representation:
 
 ```typescript
-import { ownerToHex, hexToBytes } from "@proof/trading-sdk";
+import { ownerToHex, hexToBytes, bytesToHex } from "@proof/trading-sdk";
 
-// Uint8Array → hex string (no "0x" prefix)
+// Uint8Array → hex string (no "0x" prefix) — convenience wrapper for addresses
 const hex = ownerToHex(address); // e.g. "a1b2c3...f0"
+
+// General-purpose Uint8Array → hex (works for any byte array, not just addresses)
+const pubkeyHex = bytesToHex(publicKey); // 64-char hex string
 
 // hex string → Uint8Array (accepts optional "0x" prefix)
 const bytes = hexToBytes("0xa1b2c3...f0");
+```
+
+`ownerToHex` is a thin wrapper over `bytesToHex` scoped to the 20-byte address type. Use `bytesToHex` when encoding other byte arrays (e.g. a raw public key). Use `hexToBytes` when you receive an address or key as a string from an API response.
+
+## Getting a public key from a private key
+
+`getPublicKey()` derives the 32-byte Ed25519 public key from a private key without creating a full keypair object. Useful when you already have a private key loaded from storage:
+
+```typescript
+import { getPublicKey, pubkeyToOwner, ownerToHex } from "@proof/trading-sdk";
+
+// Derive public key from an existing private key
+const publicKey = getPublicKey(privateKey); // Uint8Array (32 bytes)
+
+// Then derive the address as usual
+const address = pubkeyToOwner(publicKey);
+console.log(`Address: 0x${ownerToHex(address)}`);
+```
+
+## Verifying a signature
+
+`verify()` checks that an Ed25519 signature is valid for a given public key and message. This is used internally by the SDK but is also available for cross-language conformance tests or relayer-side validation:
+
+```typescript
+import { verify, sign, signingMessage, chainIdFromString } from "@proof/trading-sdk";
+
+// Build the v3 signing message (same as sign() uses internally)
+const chainId = chainIdFromString("exchange-devnet-1");
+const msg = signingMessage(chainId, actionType, seq, payloadBytes);
+
+// Sign it
+const signature = sign(privateKey, msg); // Uint8Array (64 bytes)
+
+// Verify the signature
+const isValid = verify(publicKey, signature, msg); // boolean
+console.log(isValid); // true
 ```
 
 Action payloads (e.g. the `owner` field of `PlaceOrder`) accept the raw `Uint8Array`; use `hexToBytes` when you receive an address as a string from an API response.

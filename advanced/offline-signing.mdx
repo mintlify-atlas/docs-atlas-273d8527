@@ -1,5 +1,5 @@
 ---
-title: "Offline Transaction Signing and Raw Wire Encoding"
+title: "Offline Transaction Signing and Raw Wire Encoding Guide"
 sidebarTitle: "Offline Signing"
 description: "Build and inspect signed wire envelopes directly — ideal for air-gapped key stores, custom gateway integrations, and cross-language conformance testing."
 ---
@@ -10,15 +10,16 @@ Proof transactions are self-contained binary envelopes: a MessagePack array carr
 
 The following functions are exported directly from `@proof/trading-sdk`:
 
-| Function | Signature | Purpose |
-|---|---|---|
-| `fetchChainId` | `(rpcUrl: string) => Promise<Uint8Array>` | Resolve a 32-byte chain ID from CometBFT `/status` over the network |
-| `chainIdFromString` | `(chainId: string) => Uint8Array` | Hash a chain ID string to 32 bytes without a network call |
-| `signAndEncode` | `(chainId, action, seq, privateKey) => Uint8Array` | Build a complete signed wire envelope |
-| `decodeTx` | `(bytes: Uint8Array) => { version, action, seq, pubkey, signature }` | Decode and verify the structure of a wire envelope |
-| `encodePayloadBytes` | `(action: Action) => Uint8Array` | Encode only the action payload, with no signature wrapper |
-| `peekActionType` | `(bytes: Uint8Array) => ActionTypeValue \| null` | Read the action type byte without a full decode |
-| `signEnvelopeFromPayload` | `(chainId, actionType, seq, payloadBytes, privateKey) => Uint8Array` | Sign and wrap pre-encoded payload bytes — useful for cross-language conformance |
+| Function | Source module | Signature | Purpose |
+|---|---|---|---|
+| `signAndEncode` | `codec` | `(chainId, action, seq, privateKey) => Uint8Array` | Build a complete signed wire envelope |
+| `encodeSignedTx` | `codec` | `(action, seq, pubkey, signature) => Uint8Array` | Assemble a wire envelope from a pre-computed pubkey and signature |
+| `encodePayloadBytes` | `codec` | `(action: Action) => Uint8Array` | Encode only the action payload, with no signature wrapper |
+| `signEnvelopeFromPayload` | `codec` | `(chainId, actionType, seq, payloadBytes, privateKey) => Uint8Array` | Sign and wrap pre-encoded payload bytes — useful for cross-language conformance |
+| `decodeTx` | `codec` | `(bytes: Uint8Array) => { version, action, seq, pubkey, signature }` | Decode and verify the structure of a wire envelope |
+| `peekActionType` | `codec` | `(bytes: Uint8Array) => ActionTypeValue \| null` | Read the action type byte without a full decode |
+| `chainIdFromString` | `crypto` | `(chainId: string) => Uint8Array` | Hash a chain ID string to 32 bytes without a network call |
+| `fetchChainId` | `client` | `(rpcUrl: string) => Promise<Uint8Array>` | Resolve a 32-byte chain ID from CometBFT `/status` over the network |
 
 ## Complete offline signing flow
 

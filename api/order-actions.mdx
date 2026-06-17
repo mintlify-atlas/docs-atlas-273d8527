@@ -1,7 +1,7 @@
 ---
-title: "Order Action Types: Place, Cancel, and Replace"
+title: "Order Action Types: Place, Cancel, Amend, and Replace"
 sidebarTitle: "Order Actions"
-description: "Full field reference for every order-management action: PlaceOrder, CancelOrder, MarketOrder, ClosePosition, AtomicBasketOrder, and all cancel/amend variants."
+description: "Full field reference for every order-management action: PlaceOrder, CancelOrder, MarketOrder, ClosePosition, AtomicBasketOrder, and cancel/amend variants."
 ---
 
 Order actions are the core of day-to-day trading on the Proof Exchange. They cover the full lifecycle of a resting order — creation, modification, cancellation, and position closure — plus the atomic basket primitive for multi-leg strategies. Every order action is user-signed: the envelope signer's derived address must match the `owner` field (or belong to an approved agent). Type signatures are drawn directly from `src/types.ts`.

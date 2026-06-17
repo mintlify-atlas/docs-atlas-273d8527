@@ -1,5 +1,5 @@
 ---
-title: "Python SDK Reference for the Proof Exchange"
+title: "Python SDK: Proof Exchange Client and Action Builders"
 sidebarTitle: "Python"
 description: "Complete reference for proof-trading-sdk: PyO3 Rust core bindings, ExchangeClient, all action builders, crypto helpers, and the hardware-key signing path."
 ---
@@ -93,8 +93,10 @@ from proof_trading_sdk import (
     ClosePosition, ApproveAgent, RevokeAgent,
     OracleUpdate, Deposit, Withdraw, WithdrawRequest,
     ConfirmDeposit, ConfirmWithdrawal, FailWithdrawal,
-    ResolveEvent, SetUserMarketLeverage,
+    ResolveEvent, FailDeposit, SetUserMarketLeverage,
     CreateMarket, CreateImpactMarket, UpdateMarketFees,
+    SetAccountFeeOverride, RunLiquidationSweep, RunFundingTick,
+    RawAction, FEE_OVERRIDE_REVERT_SENTINEL,
     encode_action, decode_action,
 )
 ```
@@ -130,7 +132,14 @@ from proof_trading_sdk import (
 
 **Relayer / admin actions**
 
-`OracleUpdate`, `Deposit`, `Withdraw`, `ConfirmDeposit`, `ConfirmWithdrawal`, `FailWithdrawal`, `ResolveEvent`, `CreateMarket`, `CreateImpactMarket`, `UpdateMarketFees`
+`OracleUpdate`, `Deposit`, `Withdraw`, `ConfirmDeposit`, `ConfirmWithdrawal`, `FailWithdrawal`, `ResolveEvent`, `FailDeposit`, `CreateMarket`, `CreateImpactMarket`, `UpdateMarketFees`, `SetAccountFeeOverride`, `RunLiquidationSweep`, `RunFundingTick`
+
+**Low-level helpers**
+
+| Symbol | Description |
+|---|---|
+| `RawAction` | Escape hatch — wraps a raw `(action_type: int, payload: bytes)` pair as an `Action` for submission. Use only when a typed dataclass is not yet available. |
+| `FEE_OVERRIDE_REVERT_SENTINEL` | Sentinel value (`4_294_967_295`) passed to `SetAccountFeeOverride` to revert a fee override back to the default tier. |
 
 **Codec helpers**
 

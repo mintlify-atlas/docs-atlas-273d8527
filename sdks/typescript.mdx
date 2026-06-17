@@ -1,5 +1,5 @@
 ---
-title: "TypeScript SDK Reference for the Proof Exchange"
+title: "TypeScript SDK: Proof Exchange Client and All Exports"
 sidebarTitle: "TypeScript"
 description: "Complete reference for @proof/trading-sdk: install, all exports by category, ExchangeClient usage, crypto helpers, codec, and error handling."
 ---
@@ -120,8 +120,8 @@ import {
 | `hexToBytes` | `(hex: string) → Uint8Array` | Decode a hex string to bytes |
 | `bytesToHex` | `(bytes: Uint8Array) → string` | Encode bytes to lowercase hex |
 | `signingMessage` | `(chainId, actionType, seq, payload) → Uint8Array` | Build the canonical `ProofExchange-v3` domain-prefixed signing message |
-| `sign` | `(privateKey, message) → Promise<Uint8Array>` | Sign a 64-byte Ed25519 signature |
-| `verify` | `(pubkey, message, signature) → Promise<boolean>` | Verify an Ed25519 signature |
+| `sign` | `(privateKey: Uint8Array, message: Uint8Array) → Uint8Array` | Sign and return a 64-byte Ed25519 signature |
+| `verify` | `(pubkey: Uint8Array, signature: Uint8Array, message: Uint8Array) → boolean` | Verify an Ed25519 signature |
 | `chainIdFromString` | `(network: string) → Uint8Array` | Hash a CometBFT network string to a 32-byte chain ID |
 | `UNBOUND_CHAIN_ID` | `Uint8Array` | 32 zero bytes — for offline fixtures only; replayable on real chains |
 

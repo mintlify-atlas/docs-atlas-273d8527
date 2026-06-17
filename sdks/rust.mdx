@@ -1,5 +1,5 @@
 ---
-title: "Rust SDK Core for the Proof Exchange"
+title: "Rust SDK: Proof Exchange Core Crate and Signer Trait"
 sidebarTitle: "Rust"
 description: "Reference for the proof-trading-sdk Rust crate: public modules, Signer trait, LocalSigner, workspace layout, codec internals, and build instructions."
 ---
@@ -64,7 +64,7 @@ pub mod wire;
 | Module | Contents |
 |---|---|
 | `codec` | `Action` enum, `encode_signed_tx`, `sign_and_encode_with_chain`, `decode_tx`, `peek_action_type`, `get_action_types`, envelope constants |
-| `crypto` | `signing_message`, `verify_signature`, `pubkey_to_owner`, `chainIdFromString`, `UNBOUND_CHAIN_ID` |
+| `crypto` | `signing_message`, `verify_signature`, `pubkey_to_owner`, `chain_id_from_string`, `UNBOUND_CHAIN_ID` |
 | `signer` | `Signer` trait, `LocalSigner`, `SignerError` |
 | `types` | All action payload structs (`PlaceOrder`, `CancelOrder`, `OracleUpdate`, …) and domain types |
 | `wire` | `Address`, `Pubkey`, and other fixed-length byte-array newtypes with length-checked decoding |

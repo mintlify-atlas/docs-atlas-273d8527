@@ -1,7 +1,7 @@
 ---
-title: "Admin and Relayer Action Types"
+title: "Admin and Relayer Action Types: Full Field Reference"
 sidebarTitle: "Admin Actions"
-description: "Complete field reference for privileged exchange actions: OracleUpdate, CreateMarket, UpdateMarketFees, CreateImpactMarket, ResolveEvent, and supporting types."
+description: "Field reference for privileged exchange actions: OracleUpdate, CreateMarket, UpdateMarketFees, CreateImpactMarket, ResolveEvent, and supporting types."
 ---
 
 Admin and relayer actions require the envelope signer's derived address to be on the engine's on-chain allowlist. Unauthorized signers receive `UnauthorizedRelayer`. These actions control oracle feeds, market creation, live parameter updates, and event resolution — operations that affect the exchange state globally rather than a single account. All type signatures are drawn directly from `src/types.ts`.
@@ -345,6 +345,17 @@ export interface CreateImpactMarket {
 <ParamField body="rules" type="string">
   Optional resolution criteria text. Encodes as `""` when absent.
 </ParamField>
+
+### Branch
+
+Used to identify which side of a binary event a child market belongs to. The `MarketKind` variants encode this as the string literal `"Yes"` or `"No"`, which maps directly to the `Branch` enum values.
+
+```typescript
+export enum Branch {
+  Yes = 1,
+  No  = 2,
+}
+```
 
 ### EventOracleSource
 

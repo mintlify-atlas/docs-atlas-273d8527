@@ -1,5 +1,5 @@
 ---
-title: "ExchangeClient: Submit, Query, and Subscribe"
+title: "ExchangeClient API Reference: Transactions, Queries, Events"
 sidebarTitle: "ExchangeClient"
 description: "Full API reference for ExchangeClient: key management, transaction submission, market reads, history queries, and real-time WebSocket subscriptions."
 ---
@@ -299,10 +299,10 @@ type Action =
   | { type: "AmendOrder";         data: AmendOrder }
   | { type: "AtomicBasketOrder";  data: AtomicBasketOrder }
   | { type: "MarketOrder";        data: MarketOrder }
-  | { type: "ClosePosition";      data: ClosePosition }
   | { type: "WithdrawRequest";    data: WithdrawRequest }
   | { type: "ApproveAgent";       data: ApproveAgent }
   | { type: "RevokeAgent";        data: RevokeAgent }
+  | { type: "ClosePosition";      data: ClosePosition }
   // … and more admin/relayer actions — see src/types.ts
 ```
 

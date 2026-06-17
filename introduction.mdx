@@ -1,5 +1,5 @@
 ---
-title: "Proof Trading SDK: Exchange Actions Over HTTP"
+title: "Proof Trading SDK: Ed25519 Signing and HTTP Trading"
 sidebarTitle: "Introduction"
 description: "The Proof Trading SDK lets you sign, encode, and submit trading actions to the Proof Exchange over HTTP—no blockchain node required."
 ---
@@ -70,7 +70,7 @@ const health = await client.queryHealth();
     Query orderbooks, open orders, account info, market configs, tickers, chain status, ADL queues, and withdrawal records without any authentication.
   </Card>
   <Card title="Submission modes" icon="paper-plane">
-    `submitTx` returns after CheckTx (fire-and-forget with background polling). `submitTxCommit` polls `/tx?hash` for up to 9 seconds for synchronous confirmation.
+    `submitTx` returns after CheckTx (fire-and-forget with background polling). `submitTxCommit` polls `/tx?hash` for up to 9 seconds for synchronous confirmation. Collect all background DeliverTx results with `awaitPendingVerifies()`.
   </Card>
   <Card title="WebSocket events" icon="bolt">
     Subscribe to real-time block events — trades, order placements, position updates, funding, and liquidations — via `client.subscribeBlocks()` or the raw `wss://` feed.

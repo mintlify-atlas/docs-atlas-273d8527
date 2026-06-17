@@ -152,7 +152,7 @@ const chainId = chainIdFromString("proof-mainnet-1");
 // Uint8Array (32 bytes) — keccak256("proof-mainnet-1")
 ```
 
-The exchange API exposes the canonical chain ID string via `GET /info`. Use [`fetchChainId`](/api/codec#fetchChainId) to retrieve and cache it automatically.
+The exchange API exposes the canonical chain ID string via `GET /info`. Use [`fetchChainId`](/api/exchange-client#fetchChainId) (exported from the client module) to retrieve and cache it automatically.
 
 <ParamField path="chainId" type="string" required>
   UTF-8 CometBFT chain ID string, e.g. `"proof-mainnet-1"`.

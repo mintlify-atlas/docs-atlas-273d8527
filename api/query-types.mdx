@@ -1,7 +1,7 @@
 ---
 title: "Query Response Types: Accounts, Orders, and Markets"
 sidebarTitle: "Query Types"
-description: "Reference for all TypeScript query response types returned by the Proof Trading SDK, including orderbook, account, position, market config, and history shapes."
+description: "Reference for all TypeScript query response types in the Proof Trading SDK: orderbook, account, position, market configuration, and trade history shapes."
 ---
 
 The Proof Trading SDK exposes a set of strongly-typed query response interfaces that mirror the engine's MessagePack wire format. Every type documented here is defined in `src/types.ts` and is returned directly by client query methods such as `queryOrderbook`, `queryAccount`, and `queryMarketConfig`. Numeric values carried as `bigint` preserve full precision for on-chain integers (prices in cents, balances in microUSDC, contract quantities); fields marked `number` are safely bounded integers such as market IDs and basis-point rates.

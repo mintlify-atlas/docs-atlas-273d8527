@@ -1,5 +1,5 @@
 ---
-title: "Get Started with the Proof Trading SDK in Minutes"
+title: "Proof Trading SDK Quickstart: Your First Limit Order"
 sidebarTitle: "Quickstart"
 description: "Install the Proof Trading SDK, generate an Ed25519 keypair, fund via devnet faucet, and place your first limit order on the Proof Exchange."
 ---
@@ -180,7 +180,7 @@ const r: TxResult = await client.submitTx({
     market: 1,
     owner: address,
     side: Side.Buy,
-    price: 50000000n,
+    price: 50000000n,   // $500,000.00 in integer cents
     quantity: 1n,
   },
 });

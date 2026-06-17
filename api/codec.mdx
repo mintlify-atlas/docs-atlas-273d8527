@@ -1,7 +1,7 @@
 ---
-title: "MessagePack Codec: Encode and Decode Transactions"
+title: "MessagePack Codec: Encode and Decode V2 Transactions"
 sidebarTitle: "Codec"
-description: "Sign, encode, and decode Proof Exchange transactions as MessagePack wire bytes using the V2 envelope format with rmp-serde-compatible BigInt handling."
+description: "Sign, encode, and decode Proof Exchange transactions as MessagePack V2 wire envelopes with V3 signing messages and rmp-serde-compatible BigInt handling."
 ---
 
 The codec module is the bridge between an `Action` object and the raw bytes the exchange accepts over the wire. It serialises action payloads with `@msgpack/msgpack`, constructs the deterministic signing message, applies an Ed25519 signature, and wraps everything into the V2 wire envelope — all in a single call. A matching decoder lets you inspect or round-trip any signed transaction without communicating with the exchange. Understanding the codec is essential for offline signing, cross-language conformance testing, and any integration that manages transaction bytes directly rather than delegating to `ExchangeClient`.
@@ -11,7 +11,7 @@ The codec module is the bridge between an `Action` object and the raw bytes the 
 Every signed transaction is a 6-element MessagePack array:
 
 ```
-[version(2), action_type(u8), seq(u64), payload(bin), pubkey(32B bin), signature(64B bin)]
+[2, action_type, seq, payload, pubkey(32B), signature(64B)]
 ```
 
 | Index | Field | Type | Description |

@@ -1,7 +1,7 @@
 ---
-title: "Delegate Trading Authority with Agent Wallets"
+title: "Delegate Trading Authority to Agent Wallets in Proof SDK"
 sidebarTitle: "Agent Wallets"
-description: "Approve a hot-wallet Ed25519 keypair to trade on your behalf while your owner key stays cold — agents can place and cancel orders but cannot withdraw funds."
+description: "Approve a hot-wallet Ed25519 keypair to trade on your behalf while your owner key stays cold — agents can place and cancel orders but cannot withdraw."
 ---
 
 An agent wallet is a second Ed25519 keypair whose public key you register against your owner account. Once approved, the agent can sign and submit `PlaceOrder`, `CancelOrder`, `CancelAllOrders`, and any other trading action on your behalf — but the engine enforces a hard separation: agents can never withdraw funds or move balances. This lets you keep your owner private key cold (or in a hardware store) while running an automated trading bot with a hot key that can only affect open positions and orders.

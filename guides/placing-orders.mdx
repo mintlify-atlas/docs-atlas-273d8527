@@ -1,5 +1,5 @@
 ---
-title: "Placing and Managing Orders on the Proof Exchange"
+title: "Placing and Cancelling Orders on the Proof Exchange"
 sidebarTitle: "Placing Orders"
 description: "Submit limit orders, market orders, and advanced order types — cancel, replace, amend, close, and basket — using the Proof Trading SDK."
 ---
@@ -378,8 +378,9 @@ The SDK provides two submission paths depending on how much confirmation you nee
 
 <CodeGroup>
 ```typescript submitTx (fire-and-forget)
+// submitTx(action: Action): Promise<TxResult>
 // Returns after CheckTx passes. A background verifier polls DeliverTx.
-const r = await client.submitTx({
+const r: TxResult = await client.submitTx({
   type: "PlaceOrder",
   data: { market: 1, owner: address, side: Side.Buy, price: 5000000n, quantity: 1n },
 });
@@ -394,8 +395,9 @@ for (const d of deliveries) {
 ```
 
 ```typescript submitTxCommit (synchronous)
+// submitTxCommit(action: Action): Promise<TxResult>
 // Polls /tx?hash up to 9s — returns the actual DeliverTx result
-const r = await client.submitTxCommit({
+const r: TxResult = await client.submitTxCommit({
   type: "PlaceOrder",
   data: { market: 1, owner: address, side: Side.Buy, price: 5000000n, quantity: 1n },
 });

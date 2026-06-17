@@ -1,7 +1,7 @@
 ---
-title: "Exchange Event Types Delivered via WebSocket"
+title: "Proof Exchange Event Types Delivered via WebSocket"
 sidebarTitle: "Event Types"
-description: "Reference for every ExchangeEvent variant emitted by the Proof exchange engine and delivered over WebSocket, including field types, units, and handling examples."
+description: "Reference for every ExchangeEvent variant emitted by the Proof engine via WebSocket, covering field types, string encoding, units, and dispatch examples."
 ---
 
 The Proof exchange engine emits a stream of strongly-typed events each time state changes — orders fill, positions open and close, funding is applied, and accounts are liquidated. These events are delivered via the WebSocket feed at `wss://api.dev.proof.trade/ws` and surfaced in the SDK through `client.subscribeBlocks`. Every variant belongs to the `ExchangeEvent` discriminated union and is identified by a string `type` field.
